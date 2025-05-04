@@ -36,7 +36,7 @@ A project like **ugnos** would be used in scenarios where you need to efficientl
 - **How:** The lightweight, efficient Rust core is ideal for resource-constrained environments.
 
 ---
-Read the [whitepaper](ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md) for more information and future enhancements.
+Read the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md) for more information and future enhancements.
 ---
 
 ## Current Features
@@ -169,7 +169,7 @@ DbConfig {
     ```
     > This example demonstrates how to create a database with persistence enabled, insert data, and query it. It also shows how to configure the database with different options. Check `examples/persistence_demo.rs` for more details. Creates ./demo_data directory with snapshots and WAL files, very small footprint, to illustrate the persistence mechanism.
 8. **Doc-tests:**
-    Doc-tests will be added after all advanced API is implemented and the project will get its version 1.0.0. Check the [whitepaper](ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md) for more details how it will be looking in the future.
+    Doc-tests will be added after all advanced API is implemented and the project will get its version 1.0.0. Check the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md) for more details how it will be looking in the future.
 
 
 ## Basic Usage (Example)
