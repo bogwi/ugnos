@@ -1,0 +1,17 @@
+# Rust target directory
+/target/
+
+# Editor configuration files
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+
+# Lock file (optional, depends on policy)
+# Cargo.lock
+
+# Dev files
+dev/
+data/
+demo_data/
