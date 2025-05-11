@@ -9,7 +9,7 @@ repository = "https://github.com/bogwi/ugnos"
 homepage = "https://github.com/bogwi/ugnos"
 documentation = "https://docs.rs/ugnos"
 readme = "README.md"
-keywords = ["time-series", "database", "db", "rust", "concurrent", "performance", "iot", "monitoring", "analytics", "storage", "columnar", "timeseries", "tsdb"]
+keywords = ["time-series", "database", "concurrent", "performance", "analytics"]
 categories = ["database-implementations", "concurrency", "data-structures"]
 
 exclude = ["dev", "data", "demo_data"]
