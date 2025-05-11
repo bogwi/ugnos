@@ -1,6 +1,6 @@
 [package]
 name = "ugnos"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A high-performance, concurrent time-series database core written in Rust, designed for efficient IoT data ingestion, real-time analytics, and monitoring."
 license = "MIT OR Apache-2.0"
