@@ -2,12 +2,15 @@
 name = "ugnos"
 version = "0.1.0"
 edition = "2021"
-description = "A high-performance time-series database core"
+description = "A high-performance, concurrent time-series database core written in Rust, designed for efficient IoT data ingestion, real-time analytics, and monitoring."
 license = "MIT OR Apache-2.0"
 authors = ["Dan Vi <bogwi@rakumail.jp>"]
 repository = "https://github.com/bogwi/ugnos"
 homepage = "https://github.com/bogwi/ugnos"
 documentation = "https://docs.rs/ugnos"
+readme = "README.md"
+keywords = ["time-series", "database", "db", "rust", "concurrent", "performance", "iot", "monitoring", "analytics", "storage", "columnar", "timeseries", "tsdb"]
+categories = ["database-implementations", "concurrency", "data-structures"]
 
 exclude = ["dev", "data", "demo_data"]
 
