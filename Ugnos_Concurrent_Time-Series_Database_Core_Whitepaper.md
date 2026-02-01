@@ -1,47 +1,73 @@
-# ugnos: Concurrent Time-Series Database Core Whitepaper
+# UGNOS: Enterprise-Grade Concurrent Time-Series Database (Rust) — Whitepaper
 
+**Status:** Vision + architecture paper (living document)  
+**Last updated:** 2026-02-01  
 **Domain:** Databases / Time-Series Analytics  
-**Toolchain:** Rust (cargo), rayon, criterion (for benchmarking), serde, clippy, rustfmt  
-**Architecture outline:** Columnar time-series storage (timestamps, values, tags), concurrent write buffer, parallel query executor, and serialization layer.  
-**Description:**
-A minimal, high-performance time-series database core. Uses DOD to store timestamps, values, and tags in separate vectors, enabling fast concurrent writes and parallel queries. Designed for scalability and efficient memory usage. 
-
-A project like **"ugnos: Concurrent Time-Series Database Core"** would be used in scenarios where you need to efficiently store, write, and query large volumes of time-stamped data, especially when high concurrency and performance are required. Here are some concrete use cases and domains where such a project would be valuable:
+**Primary deliverables:** deployable server binary (**`ugnosd`**) + embeddable library crate (**`ugnos`**)  
+**Current codebase reality (v0.1.x):** a fast single-node in-memory core with WAL + snapshots and parallel range queries (no production server binary yet).
 
 ---
 
-### 1. **IoT Data Ingestion and Analytics**
-- **Why:** IoT devices generate massive streams of time-stamped sensor data.
-- **How:** The database core can ingest concurrent writes from thousands of devices and allow fast, parallel analytics on the collected data.
+## Executive summary
 
-### 2. **Financial Market Data Storage**
-- **Why:** Financial systems need to store and analyze high-frequency trading data (tick data, order books, etc.).
-- **How:** The columnar, concurrent design allows for rapid ingestion and real-time querying of market events.
+UGNOS is evolving into an **enterprise-grade time-series database** designed for the next decade’s high-throughput workloads:
 
-### 3. **Monitoring and Observability Platforms**
-- **Why:** Infrastructure and application monitoring tools (like Prometheus, InfluxDB) need to store metrics (CPU, memory, network) over time.
-- **How:** The core can serve as the backend for storing and querying these metrics efficiently.
+- **AI workflows**: feature/embedding telemetry, training/eval traces, pipeline metrics, experiment events
+- **Social networks**: high-cardinality event streams, engagement telemetry, near-real-time analytics
+- **Financial systems**: tick/quote/event capture, risk telemetry, audit-grade durability and controls
 
-### 4. **Scientific Experimentation and Research**
-- **Why:** Experiments often generate time-series data (e.g., environmental sensors, lab instruments).
-- **How:** Researchers can use the database to store, tag, and analyze experiment results in parallel.
+UGNOS will be available in two forms:
 
-### 5. **Industrial Automation and SCADA Systems**
-- **Why:** Industrial systems log time-stamped events and sensor readings for process control and diagnostics.
-- **How:** The database can handle high-throughput writes from multiple sources and support fast queries for dashboards and alerts.
+- **`ugnos` (library crate):** embed the storage + query engine directly in Rust services for low-latency, in-process operation.
+- **`ugnosd` (server binary):** run UGNOS as a production daemon with stable APIs, security controls, and operational tooling.
 
-### 6. **Real-Time Analytics for Web and Mobile Apps**
-- **Why:** Apps may track user events, interactions, or telemetry as time-series data.
-- **How:** The core can power analytics dashboards or anomaly detection engines.
-
-### 7. **Edge Computing and Local Data Aggregation**
-- **Why:** Edge devices may need to locally store and process time-series data before syncing to the cloud.
-- **How:** The lightweight, efficient Rust core is ideal for resource-constrained environments.
+There are **zero compromises** on production quality: correctness, durability, security, observability, and operability are first-class requirements.
 
 ---
 
-**In summary:**  
-You would use this project as the storage and query engine wherever you need to handle large, concurrent, and high-performance time-series data workloads—especially when you want a modern, safe, and efficient implementation (Rust) that can scale with your needs. It could be the foundation for a custom time-series database, a component in a larger analytics system, or a backend for any application that needs to track and analyze time-stamped data.
+## Enterprise goals (non-negotiable)
+
+- **Correctness and durability**: deterministic crash recovery, checksummed persistence formats, corruption detection, and well-defined failure semantics.
+- **Operational excellence**: production telemetry (metrics/logs/traces), safe configuration, backpressure, capacity controls, and documented runbooks.
+- **Security by default**: TLS/mTLS, authentication and authorization, audit logs, and encryption at rest as a product capability.
+- **Scale path**: single-node excellence first, then multi-tenant isolation, then clustering (HA + horizontal scale) with explicit consistency guarantees.
+
+---
+
+## Deployment model
+
+- **Embedded mode (library crate)**: `ugnos` is linked into a Rust process for ultra-low-latency ingest/query and tight integration with application logic.
+- **Server mode (deployable binary)**: `ugnosd` runs as a daemon with stable network APIs, operational endpoints, and enterprise controls (authn/z, audit, quotas).
+
+---
+
+## Roadmap at a glance
+
+UGNOS is explicitly staged to avoid premature distributed complexity:
+
+- **Milestone 0 (0.2.x)**: harden the existing core (format versioning, checksums, deterministic recovery, observability scaffolding).
+- **Milestone 1 (0.3.x–0.4.x)**: build a real single-node durable engine (segments, compaction, retention, indexing, compression).
+- **Milestone 2 (0.5.x–0.7.x)**: ship `ugnosd` + stable APIs + a production query surface.
+- **Milestone 3 (0.8.x–0.9.x)**: multi-tenancy + security posture (mTLS, RBAC, audit, encryption at rest).
+- **Milestone 4 (1.0)**: HA clustering with explicit consistency guarantees and online operations.
+
+---
+
+## Target workloads and constraints
+
+UGNOS is optimized for workloads that combine:
+
+- **High ingest concurrency** (bursts and sustained streams)
+- **Time-range scans + tag-based filters** (high-cardinality tags included)
+- **Aggregations and downsampling** (window queries, rollups)
+- **Predictable latency under mixed load** (bounded background work: flush/compaction/retention)
+
+---
+
+## Document map
+
+- **Sections 1–10 (below):** describe the current architectural direction and the existing core design.
+- **Appendices:** contain API sketches and usage scenarios (planned interfaces, not all implemented).
 
 ---
 
@@ -314,7 +340,7 @@ struct Database {
 ---
 
 
-# Time-Series Database Core Advanced API
+## Appendix B: Advanced API sketch (planned)
 
 This document describes the advanced API functions for the Rust concurrent time-series database core. Each function includes its signature, arguments, return type, and documentation.
 
@@ -533,7 +559,7 @@ enum DbError {
 }
 ``` 
 
-# USAGE.md
+## Appendix C: Usage scenarios (planned)
 
 ## Usage Scenarios for the Rust Concurrent Time-Series Database Core
 
