@@ -15,3 +15,7 @@
 dev/
 data/
 demo_data/
+
+# Ugnos files
+*.bin
+*.seg

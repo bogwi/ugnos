@@ -1,11 +1,11 @@
 use crate::error::DbError;
-use crate::types::DataPoint;
+use crate::types::Row;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // Type alias for the buffer of a single series, protected by a Mutex.
 // Arc allows sharing the Mutex across threads if needed, though here it's owned by the WriteBuffer HashMap.
-type SeriesWriteBuffer = Arc<Mutex<Vec<DataPoint>>>;
+type SeriesWriteBuffer = Arc<Mutex<Vec<Row>>>;
 
 /// A sharded write buffer for staging incoming data points before flushing to storage.
 /// Uses a HashMap where keys are series names and values are mutex-protected Vecs.
@@ -18,7 +18,7 @@ impl WriteBuffer {
     /// Stages a single data point into the buffer for the corresponding series.
     /// If the series buffer doesn't exist, it's created.
     /// Acquires a lock only on the specific series buffer being written to.
-    pub fn stage(&mut self, series: &str, point: DataPoint) -> Result<(), DbError> {
+    pub(crate) fn stage(&mut self, series: &str, row: Row) -> Result<(), DbError> {
         let buffer_arc = self
             .buffers
             .entry(series.to_string()) // Clone series name for ownership in HashMap
@@ -26,7 +26,7 @@ impl WriteBuffer {
 
         // Lock the specific series buffer and append the point
         let mut buffer_guard = buffer_arc.lock()?; // Propagate PoisonError
-        buffer_guard.push(point);
+        buffer_guard.push(row);
 
         Ok(())
     }
@@ -35,26 +35,21 @@ impl WriteBuffer {
     /// This requires acquiring locks on all buffers sequentially.
     /// Consider potential performance implications if there are many series.
     /// Returns a HashMap mapping series names to their drained data points.
-    pub fn drain_all_buffers(&mut self) -> HashMap<String, Vec<DataPoint>> {
+    pub(crate) fn drain_all_buffers(&mut self) -> Result<HashMap<String, Vec<Row>>, DbError> {
         let mut drained_data = HashMap::new();
         for (series_name, buffer_arc) in self.buffers.iter() {
-            // Attempt to lock the buffer. If poisoned, perhaps log and skip?
-            if let Ok(mut buffer_guard) = buffer_arc.lock() {
-                // Drain the buffer if it's not empty
-                if !buffer_guard.is_empty() {
-                    // Use std::mem::take to efficiently drain the Vec
-                    let points = std::mem::take(&mut *buffer_guard);
-                    drained_data.insert(series_name.clone(), points);
-                }
-            } else {
-                // Log or handle the poison error appropriately
-                // For now, we just skip this buffer if poisoned
-                eprintln!("Warning: Buffer for series 	{}	 is poisoned, skipping drain.", series_name);
+            let mut buffer_guard = buffer_arc.lock().map_err(|e| {
+                DbError::LockError(format!(
+                    "Write buffer for series '{}' poisoned during drain: {}",
+                    series_name, e
+                ))
+            })?;
+            if !buffer_guard.is_empty() {
+                let points = std::mem::take(&mut *buffer_guard);
+                drained_data.insert(series_name.clone(), points);
             }
         }
-        // Optionally, remove entries from self.buffers if they are now empty and haven't been written to recently?
-        // Or keep them around to avoid reallocation.
-        drained_data
+        Ok(drained_data)
     }
 
     // /// Alternative: Drain only buffers exceeding a certain size threshold.
@@ -66,13 +61,13 @@ impl WriteBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{TagSet, Timestamp, Value};
+    use crate::types::{Row, TagSet, Timestamp, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;
-    use std::sync::Arc;
 
-    fn create_point(ts: Timestamp, val: Value, tags: TagSet) -> DataPoint {
-        DataPoint {
+    fn create_row(seq: u64, ts: Timestamp, val: Value, tags: TagSet) -> Row {
+        Row {
+            seq,
             timestamp: ts,
             value: val,
             tags,
@@ -101,13 +96,13 @@ mod tests {
         // Create a point with real timestamp
         let ts = get_current_timestamp();
         let tags = create_tags(&[("host", "server1")]);
-        let point = create_point(ts, 42.0, tags);
+        let row = create_row(1, ts, 42.0, tags);
         
         // Stage the point
-        buffer.stage(series, point.clone()).unwrap();
+        buffer.stage(series, row.clone()).unwrap();
         
         // Drain and verify
-        let drained = buffer.drain_all_buffers();
+        let drained = buffer.drain_all_buffers().unwrap();
         
         assert_eq!(drained.len(), 1, "Should have one series");
         assert!(drained.contains_key(series), "Should contain our series");
@@ -133,12 +128,12 @@ mod tests {
         let tags = create_tags(&[("host", "server1")]);
         
         // Stage multiple points to the same series
-        buffer.stage(series, create_point(ts1, 1.0, tags.clone())).unwrap();
-        buffer.stage(series, create_point(ts2, 2.0, tags.clone())).unwrap();
-        buffer.stage(series, create_point(ts3, 3.0, tags.clone())).unwrap();
+        buffer.stage(series, create_row(1, ts1, 1.0, tags.clone())).unwrap();
+        buffer.stage(series, create_row(2, ts2, 2.0, tags.clone())).unwrap();
+        buffer.stage(series, create_row(3, ts3, 3.0, tags.clone())).unwrap();
         
         // Drain and verify
-        let drained = buffer.drain_all_buffers();
+        let drained = buffer.drain_all_buffers().unwrap();
         
         assert_eq!(drained.len(), 1, "Should have one series");
         
@@ -172,11 +167,11 @@ mod tests {
         let tags2 = create_tags(&[("region", "us-west")]);
         
         // Stage points to different series
-        buffer.stage(series1, create_point(ts1, 1.0, tags1.clone())).unwrap();
-        buffer.stage(series2, create_point(ts2, 2.0, tags2.clone())).unwrap();
+        buffer.stage(series1, create_row(1, ts1, 1.0, tags1.clone())).unwrap();
+        buffer.stage(series2, create_row(2, ts2, 2.0, tags2.clone())).unwrap();
         
         // Drain and verify
-        let drained = buffer.drain_all_buffers();
+        let drained = buffer.drain_all_buffers().unwrap();
         
         assert_eq!(drained.len(), 2, "Should have two series");
         assert!(drained.contains_key(series1), "Should contain series1");
@@ -198,7 +193,7 @@ mod tests {
         let mut buffer = WriteBuffer::default();
         
         // Drain without staging any points
-        let drained = buffer.drain_all_buffers();
+        let drained = buffer.drain_all_buffers().unwrap();
         
         assert_eq!(drained.len(), 0, "Drained data should be empty");
     }
@@ -211,14 +206,14 @@ mod tests {
         // Stage a point
         let ts = get_current_timestamp();
         let tags = create_tags(&[("host", "server1")]);
-        buffer.stage(series, create_point(ts, 1.0, tags)).unwrap();
+        buffer.stage(series, create_row(1, ts, 1.0, tags)).unwrap();
         
         // Drain
-        let first_drain = buffer.drain_all_buffers();
+        let first_drain = buffer.drain_all_buffers().unwrap();
         assert_eq!(first_drain.len(), 1, "First drain should contain our series");
         
         // Drain again - should be empty
-        let second_drain = buffer.drain_all_buffers();
+        let second_drain = buffer.drain_all_buffers().unwrap();
         assert_eq!(second_drain.len(), 0, "Second drain should be empty");
     }
     
@@ -254,11 +249,11 @@ mod tests {
                         ("point_id", &i.to_string())
                     ]);
                     
-                    let point = create_point(ts, value, tags);
+                    let row = create_row((thread_id * 1000 + i) as u64, ts, value, tags);
                     
                     // Acquire lock and stage point
                     let mut buffer_guard = buffer_clone.lock().unwrap();
-                    buffer_guard.stage(&series_name, point).unwrap();
+                    buffer_guard.stage(&series_name, row).unwrap();
                     
                     // Small sleep to allow thread interleaving
                     thread::sleep(std::time::Duration::from_nanos(1));
@@ -275,7 +270,7 @@ mod tests {
         
         // Drain the buffer and verify
         let mut buffer_guard = buffer.lock().unwrap();
-        let drained = buffer_guard.drain_all_buffers();
+        let drained = buffer_guard.drain_all_buffers().unwrap();
         
         // Should have one series with num_threads * points_per_thread points
         assert_eq!(drained.len(), 1, "Should have one series");
@@ -317,11 +312,11 @@ mod tests {
         
         // Point with no tags
         let no_tags = TagSet::new();
-        buffer.stage(series, create_point(ts_base, 1.0, no_tags)).unwrap();
+        buffer.stage(series, create_row(1, ts_base, 1.0, no_tags)).unwrap();
         
         // Point with one tag
         let one_tag = create_tags(&[("region", "us-east")]);
-        buffer.stage(series, create_point(ts_base + 1, 2.0, one_tag)).unwrap();
+        buffer.stage(series, create_row(2, ts_base + 1, 2.0, one_tag)).unwrap();
         
         // Point with multiple tags
         let multi_tags = create_tags(&[
@@ -330,10 +325,10 @@ mod tests {
             ("service", "api"),
             ("version", "1.0")
         ]);
-        buffer.stage(series, create_point(ts_base + 2, 3.0, multi_tags.clone())).unwrap();
+        buffer.stage(series, create_row(3, ts_base + 2, 3.0, multi_tags.clone())).unwrap();
         
         // Drain and verify
-        let drained = buffer.drain_all_buffers();
+        let drained = buffer.drain_all_buffers().unwrap();
         let points = &drained[series];
         
         assert_eq!(points.len(), 3, "Should have three points");

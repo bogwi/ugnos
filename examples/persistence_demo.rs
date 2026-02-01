@@ -20,6 +20,7 @@ fn main() -> Result<(), DbError> {
         enable_wal: true,
         enable_snapshots: true,
         snapshot_interval: Duration::from_secs(5), // Snapshot every 5 seconds
+        ..DbConfig::default()
     };
     
     println!("Creating database with persistence enabled");

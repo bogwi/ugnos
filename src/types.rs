@@ -9,6 +9,19 @@ pub type Value = f64;
 /// TagSet type (using a HashMap for flexibility).
 pub type TagSet = HashMap<String, String>;
 
+/// Internal row representation used for durability/segments.
+///
+/// This is intentionally **not** exposed as part of the public API surface;
+/// the public API works with `(series, timestamp, value, tags)` and queries return `(timestamp, value)`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Row {
+    /// Monotonic sequence number assigned at insert time.
+    pub seq: u64,
+    pub timestamp: Timestamp,
+    pub value: Value,
+    pub tags: TagSet,
+}
+
 /// Represents a single data point received via API or stored temporarily in buffer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataPoint {

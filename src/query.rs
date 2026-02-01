@@ -88,7 +88,6 @@ fn check_tags(point_tags: &TagSet, filter_tags: &TagSet) -> bool {
 mod tests {
     use super::*;
     use crate::types::{DataPoint, TimeSeriesChunk};
-    use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;

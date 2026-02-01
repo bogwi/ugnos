@@ -10,7 +10,6 @@ This crate provides a high-performance, concurrent time-series database core for
 
 See the README for usage examples and more details.
 "#]
-#![allow(unused_imports)]
 // Declare modules
 pub mod buffer;
 pub mod core;
@@ -18,7 +17,9 @@ pub mod error;
 pub mod index;
 pub mod persistence;
 pub mod query;
+pub mod segments;
 pub mod storage;
+pub mod telemetry;
 pub mod types;
 pub mod utils;
 
@@ -32,6 +33,8 @@ pub use crate::error::DbError;
 pub use crate::persistence::WriteAheadLog;
 /// Snapshot manager for point-in-time backups and fast recovery.
 pub use crate::persistence::Snapshotter;
+/// Structured event hook for observability.
+pub use crate::telemetry::{DbEvent, DbEventListener};
 /// Represents a single time-series data point.
 pub use crate::types::DataPoint;
 /// Type alias for a set of tags (key-value pairs) associated with a data point.

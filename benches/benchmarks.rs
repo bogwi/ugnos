@@ -23,6 +23,8 @@ fn create_db_config(flush_interval: Duration) -> DbConfig {
     let mut config = DbConfig::default();
     config.flush_interval = flush_interval;
     config.enable_wal = !is_nowal_enabled();
+    // Benchmarks focus on in-memory engine; avoid disk-heavy segments by default.
+    config.enable_segments = false;
     config
 }
 

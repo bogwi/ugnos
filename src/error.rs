@@ -28,6 +28,13 @@ pub enum DbError {
     #[error("Background task error: {0}")]
     BackgroundTaskError(String),
 
+    #[error("Corruption detected: {details}")]
+    Corruption {
+        details: String,
+        series: Option<String>,
+        timestamp: Option<u64>,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

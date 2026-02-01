@@ -35,7 +35,17 @@ fn setup_test_dir(dir_name: &str) -> PathBuf {
 #[test]
 fn test_insert_and_query_single_series() {
     // Use a short flush interval for testing
-    let db = DbCore::new(Duration::from_millis(50));
+    let data_dir = setup_test_dir("insert_and_query_single_series");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     let series_name = "test_series_1";
 
     let tags1 = tags_from(&[("host", "serverA"), ("region", "us-east")]);
@@ -49,7 +59,6 @@ fn test_insert_and_query_single_series() {
     // Wait longer than flush interval to ensure data is persisted
     // Or trigger flush manually for deterministic tests
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100)); // Give flush thread time
 
     // Query all data
     let mut results_all = db.query(series_name, 0..400, None).unwrap();
@@ -97,7 +106,17 @@ fn test_insert_and_query_single_series() {
 
 #[test]
 fn test_query_non_existent_series() {
-    let db = DbCore::default(); // Use default flush interval
+    let data_dir = setup_test_dir("query_non_existent_series");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     let result = db.query("non_existent_series", 0..100, None);
     match result {
         Err(DbError::SeriesNotFound(name)) => assert_eq!(name, "non_existent_series"),
@@ -107,7 +126,17 @@ fn test_query_non_existent_series() {
 
 #[test]
 fn test_insert_multiple_series() {
-    let db = DbCore::new(Duration::from_millis(50));
+    let data_dir = setup_test_dir("insert_multiple_series");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     let series1 = "cpu_usage";
     let series2 = "memory_usage";
 
@@ -120,7 +149,6 @@ fn test_insert_multiple_series() {
     db.insert(series2, 210, 56.8, tags_s2.clone()).unwrap();
 
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
 
     // Query series 1
     let mut results1 = db.query(series1, 0..300, None).unwrap();
@@ -135,7 +163,17 @@ fn test_insert_multiple_series() {
 
 #[test]
 fn test_concurrent_inserts() {
-    let db = Arc::new(DbCore::new(Duration::from_millis(20))); // Use Arc for sharing across threads
+    let data_dir = setup_test_dir("concurrent_inserts");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(20),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = Arc::new(DbCore::with_config(config).unwrap()); // Use Arc for sharing across threads
     let num_threads = 4;
     let points_per_thread = 100;
     let series_name = "concurrent_series";
@@ -162,7 +200,6 @@ fn test_concurrent_inserts() {
 
     // Flush and wait
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
 
     // Query all data
     let total_points = num_threads * points_per_thread;
@@ -181,10 +218,19 @@ fn test_concurrent_inserts() {
 
 #[test]
 fn test_invalid_time_range() {
-    let db = DbCore::default();
+    let data_dir = setup_test_dir("invalid_time_range");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     db.insert("test", 100, 1.0, TagSet::new()).unwrap();
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
 
     let result = db.query("test", 100..50, None);
     match result {
@@ -218,6 +264,8 @@ fn test_snapshot_and_recover() {
         enable_wal: true,
         enable_snapshots: true,
         snapshot_interval: Duration::from_secs(10), // Long enough to not trigger automatically
+        enable_segments: false,
+        ..DbConfig::default()
     };
     
     // Lists to store timestamps for verification
@@ -353,6 +401,8 @@ fn test_recover_with_no_persistence() {
         enable_wal: false,
         enable_snapshots: false,
         snapshot_interval: Duration::from_secs(10),
+        enable_segments: false,
+        ..DbConfig::default()
     };
     
     // Create database
@@ -376,6 +426,8 @@ fn test_wal_recovery_only() {
         enable_wal: true,
         enable_snapshots: false, // No snapshots
         snapshot_interval: Duration::from_secs(10),
+        enable_segments: false,
+        ..DbConfig::default()
     };
     
     // Create database and insert test data
@@ -442,6 +494,8 @@ fn test_snapshot_method_error() {
         enable_wal: true,
         enable_snapshots: false, // Snapshots disabled
         snapshot_interval: Duration::from_secs(10),
+        enable_segments: false,
+        ..DbConfig::default()
     };
     
     // Create database
@@ -474,6 +528,8 @@ fn test_wal_recovery_after_snapshot() {
         enable_wal: true,
         enable_snapshots: true,
         snapshot_interval: Duration::from_secs(10),
+        enable_segments: false,
+        ..DbConfig::default()
     };
     
     let series_name = "test_recovery_series";
@@ -629,7 +685,17 @@ fn test_wal_recovery_after_snapshot() {
 
 #[test]
 fn test_empty_inserts_and_tags() {
-    let db = DbCore::new(Duration::from_millis(50));
+    let data_dir = setup_test_dir("empty_inserts_and_tags");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     
     // Test with empty tag set
     let empty_tags = TagSet::new();
@@ -643,7 +709,6 @@ fn test_empty_inserts_and_tags() {
     
     db.insert(series_name, timestamp, 42.0, empty_tags.clone()).unwrap();
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
     
     // Query with empty tag filter
     let results = db.query(series_name, 0..(timestamp+1), Some(&empty_tags)).unwrap();
@@ -667,7 +732,17 @@ fn test_empty_inserts_and_tags() {
 #[test]
 fn test_large_number_of_points() {
     // Create DB with short flush interval for testing
-    let db = DbCore::new(Duration::from_millis(50));
+    let data_dir = setup_test_dir("large_number_of_points");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     let series_name = "large_series";
     
     // Number of points to insert
@@ -707,7 +782,6 @@ fn test_large_number_of_points() {
     
     // Flush and ensure data is persisted
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(200)); // Give more time for flush
     
     // Get min and max timestamps for querying
     let min_timestamp = SystemTime::now()
@@ -741,7 +815,17 @@ fn test_large_number_of_points() {
 
 #[test]
 fn test_specific_tag_combinations() {
-    let db = DbCore::new(Duration::from_millis(50));
+    let data_dir = setup_test_dir("specific_tag_combinations");
+    let config = DbConfig {
+        flush_interval: Duration::from_millis(50),
+        data_dir,
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        ..DbConfig::default()
+    };
+    let db = DbCore::with_config(config).unwrap();
     let series_name = "tag_combinations";
     
     // Create points with various tag combinations
@@ -787,7 +871,6 @@ fn test_specific_tag_combinations() {
     
     // Flush to ensure all data is persisted
     db.flush().unwrap();
-    thread::sleep(Duration::from_millis(100));
     
     // Query with various tag filters
     
@@ -827,10 +910,5 @@ fn test_specific_tag_combinations() {
     assert_eq!(nonexistent_results.len(), 0, "Expected 0 points with non-existent tag");
 }
 
-#[test]
-fn zz_cleanup_remove_data() {
-    println!("Cleaning up integration test data directory...");
-    let _ = fs::remove_dir_all(PathBuf::from("./data"));
-    println!("Integration test cleanup complete.");
-}
+// NOTE: tests use per-test directories; no global cleanup required.
 

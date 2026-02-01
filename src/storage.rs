@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::types::{DataPoint, TagSet, TimeSeriesChunk, Timestamp, Value};
+use crate::types::{DataPoint, TimeSeriesChunk};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -120,7 +120,7 @@ impl InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TagSet;
+    use crate::types::{TagSet, Timestamp, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;
 
