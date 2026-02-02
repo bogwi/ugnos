@@ -7,6 +7,7 @@ use crate::query::execute_query;
 use crate::segments::{SegmentStore, SegmentStoreConfig};
 use crate::storage::InMemoryStorage;
 use crate::telemetry::{noop_event_listener, DbEvent, DbEventListener};
+use crate::telemetry::db_metrics;
 use crate::types::{DataPoint, Row, TagSet, Timestamp, Value};
 
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Commands sent to the background flush thread to control flushing, shutdown, and snapshotting.
@@ -165,6 +166,7 @@ impl DbCore {
             events.on_event(DbEvent::FlushThreadStarted);
 
             let mut do_flush = |ack: Option<mpsc::Sender<Result<(), DbError>>>| -> bool {
+                let flush_started = Instant::now();
                 // Advance retention tombstone watermark if configured.
                 if let (Some(store), Some(ttl)) = (&segment_store_clone, config_clone.retention_ttl) {
                     let now = SystemTime::now();
@@ -230,6 +232,11 @@ impl DbCore {
                 };
                 drop(buffer_guard);
 
+                let points_to_flush: u64 = rows_to_flush
+                    .values()
+                    .map(|rows| rows.len() as u64)
+                    .sum();
+
                 let mut flush_result: Result<(), DbError> = Ok(());
 
                 if !rows_to_flush.is_empty() {
@@ -274,9 +281,15 @@ impl DbCore {
                     let _ = std::fs::remove_file(rotated);
                 }
 
+                let flush_ok = flush_result.is_ok();
+
                 if let Some(ack) = ack {
                     let _ = ack.send(flush_result);
                 }
+
+                // Metrics: record flush duration (always) and points (only if successful).
+                let elapsed = flush_started.elapsed();
+                db_metrics::record_flush(elapsed, if flush_ok { points_to_flush } else { 0 });
 
                 true
             };
@@ -322,6 +335,7 @@ impl DbCore {
                     // Received command to create a snapshot
                     Ok(FlushCommand::Snapshot { ack }) => {
                         if let Some(snapshotter) = &snapshotter_clone {
+                            let flush_started = Instant::now();
                             // First flush any pending data
                             let mut buffer_guard = match buffer_clone.lock() {
                                 Ok(guard) => guard,
@@ -334,6 +348,8 @@ impl DbCore {
                             };
                             drop(buffer_guard);
                             
+                            let points_to_flush: u64 = data_to_flush.values().map(|rows| rows.len() as u64).sum();
+
                             if !data_to_flush.is_empty() {
                                 if let Some(store) = &segment_store_clone {
                                     let _ = store.ingest_l0(data_to_flush.clone());
@@ -356,6 +372,9 @@ impl DbCore {
                                     let _ = storage_guard.append_batch(data_points_to_flush);
                                 }
                             }
+
+                            // Metrics: snapshot-triggered flush duration + points.
+                            db_metrics::record_flush(flush_started.elapsed(), points_to_flush);
                             
                             // Now create the snapshot
                             if let Ok(storage_guard) = storage_clone.read() {
@@ -655,7 +674,11 @@ impl DbCore {
         // Acquire lock on the write buffer
         let mut buffer_guard = self.write_buffer.lock()?; // Propagate PoisonError
         // Stage the data point
-        buffer_guard.stage(series, row)
+        let res = buffer_guard.stage(series, row);
+        if res.is_ok() {
+            db_metrics::record_ingest_points(1);
+        }
+        res
     }
 
     /// Queries data points from a specific time series within a given time range,
@@ -713,12 +736,18 @@ impl DbCore {
     /// # Errors
     /// Returns an error if the background thread cannot be reached.
     pub fn flush(&self) -> Result<(), DbError> {
+        let started = Instant::now();
         let (tx, rx) = mpsc::channel();
         self.flush_cmd_tx
             .send(FlushCommand::Flush { ack: Some(tx) })
             .map_err(|e| DbError::BackgroundTaskError(format!("Failed to send flush command: {}", e)))?;
-        rx.recv()
+        let res = rx.recv()
             .map_err(|e| DbError::BackgroundTaskError(format!("Failed to receive flush ack: {}", e)))?
+            ;
+        if res.is_ok() {
+            db_metrics::record_flush_end_to_end(started.elapsed());
+        }
+        res
     }
 
     /// Forces a compaction cycle and waits for completion (if segments are enabled).

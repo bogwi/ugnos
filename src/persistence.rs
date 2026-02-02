@@ -1,10 +1,12 @@
 use crate::error::DbError;
+use crate::telemetry::db_metrics as db_metrics;
 use crate::types::{DataPoint, TagSet, Timestamp, Value};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use crc32fast::Hasher as Crc32;
 use serde::{Deserialize, Serialize};
 
@@ -133,10 +135,12 @@ impl WriteAheadLog {
         }
         
         if let Some(log_file) = &mut self.log_file {
+            let mut bytes_written: u64 = 0;
             for entry in &self.pending_entries {
                 match self.format_version {
                     2 => {
                         let payload = encode_wal_record_v2(entry)?;
+                        bytes_written = bytes_written.saturating_add(8_u64.saturating_add(payload.len() as u64)); // len(u32)+crc(u32)+payload
                         let mut hasher = Crc32::new();
                         hasher.update(&payload);
                         let crc = hasher.finalize();
@@ -149,6 +153,7 @@ impl WriteAheadLog {
                     _ => {
                         let serialized = bincode::serialize(entry)
                             .map_err(|e| DbError::Serialization(e.to_string()))?;
+                        bytes_written = bytes_written.saturating_add(4_u64.saturating_add(serialized.len() as u64)); // len(u32)+payload
                         let len = serialized.len() as u32;
                         log_file.write_all(&len.to_le_bytes())?;
                         log_file.write_all(&serialized)?;
@@ -158,7 +163,10 @@ impl WriteAheadLog {
             
             // Ensure it's written to disk
             log_file.flush()?;
+            let sync_started = Instant::now();
             log_file.get_ref().sync_data()?;
+            db_metrics::record_wal_fsync(sync_started.elapsed());
+            db_metrics::record_wal_bytes_written(bytes_written);
             
             // Clear pending entries
             self.pending_entries.clear();
@@ -275,7 +283,9 @@ fn write_wal_header(file: &mut File, version: u32) -> Result<(), DbError> {
     file.write_all(WAL_MAGIC).map_err(DbError::Io)?;
     file.write_all(&version.to_le_bytes()).map_err(DbError::Io)?;
     file.flush().map_err(DbError::Io)?;
+    let sync_started = Instant::now();
     file.sync_data().map_err(DbError::Io)?;
+    db_metrics::record_wal_fsync(sync_started.elapsed());
     Ok(())
 }
 
@@ -523,6 +533,7 @@ impl Snapshotter {
         series_data: &HashMap<String, Arc<RwLock<crate::types::TimeSeriesChunk>>>,
         timestamp: Timestamp,
     ) -> Result<PathBuf, DbError> {
+        let started = Instant::now();
         // Build payload in-memory so we can checksum it.
         let mut series_names: Vec<&String> = series_data.keys().collect();
         series_names.sort();
@@ -598,6 +609,8 @@ impl Snapshotter {
 
         fs::rename(&tmp_path, &final_path)?;
         sync_dir(&self.snapshot_dir)?;
+        let size = fs::metadata(&final_path)?.len();
+        db_metrics::record_snapshot(started.elapsed(), size);
         Ok(final_path)
     }
     

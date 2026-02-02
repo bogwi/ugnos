@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + integration tests
+        run: cargo test
+
+  microbench:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      # Regression thresholds: tune for your CI runner if needed.
+      #
+      # These are intentionally conservative to avoid flaky failures while still catching
+      # meaningful regressions.
+      UGNOS_MICROBENCH_POINTS: "50000"
+      UGNOS_MIN_INGEST_PTS_PER_SEC: "20000"
+      UGNOS_MAX_FLUSH_MS: "2000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run microbench regression gates (release)
+        run: cargo test --release --test microbench_regressions -- --ignored
+      - name: Install Valgrind (for iai-callgrind microbench suite)
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Run deterministic microbench suite (iai-callgrind)
+        run: cargo bench --bench microbench_iai
+

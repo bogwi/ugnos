@@ -1,118 +1,102 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ugnos::{DbCore, DbConfig, TagSet};
+mod datasets;
+
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use tempfile::TempDir;
+use ugnos::{DbConfig, DbCore, TagSet};
+
 use std::time::Duration;
-use std::env;
-use std::path::PathBuf;
-use std::fs;
 
-// Helper to create tags
-fn tags_from(pairs: &[(&str, &str)]) -> TagSet {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+fn make_config(data_dir: &std::path::Path, enable_wal: bool) -> DbConfig {
+    let mut cfg = DbConfig::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    cfg.enable_segments = false; // microbench suite focuses on in-memory path determinism
+    cfg.enable_wal = enable_wal;
+    cfg.wal_buffer_size = 1024;
+    cfg.enable_snapshots = false;
+    cfg.flush_interval = Duration::from_secs(60 * 60);
+    cfg
 }
 
-// Check if WAL should be disabled via environment variable
-fn is_nowal_enabled() -> bool {
-    env::var("NOWAL").is_ok()
-}
+fn bench_ingest_fixed_dataset(c: &mut Criterion) {
+    let ops = datasets::generate_insert_ops(datasets::DEFAULT_SEED, 20_000, 64, 4, 16);
 
-// Create DbConfig based on flags
-fn create_db_config(flush_interval: Duration) -> DbConfig {
-    let mut config = DbConfig::default();
-    config.flush_interval = flush_interval;
-    config.enable_wal = !is_nowal_enabled();
-    // Benchmarks focus on in-memory engine; avoid disk-heavy segments by default.
-    config.enable_segments = false;
-    config
-}
-
-// Benchmark for inserting single points
-fn bench_insert_single(c: &mut Criterion) {
-    let config = create_db_config(Duration::from_secs(60)); // Use longer flush interval for benchmark
-    let db = DbCore::with_config(config).unwrap();
-    
-    let wal_status = if is_nowal_enabled() { "disabled" } else { "enabled" };
-    println!("Running insert benchmark with WAL {}", wal_status);
-    
-    let series_name = "bench_insert_series";
-    let tags = tags_from(&[("host", "server_bench"), ("region", "bench_region")]);
-
-    c.bench_function("insert_single", |b| {
-        let mut i = 0u64;
-        b.iter(|| {
-            db.insert(
-                black_box(series_name),
-                black_box(i),
-                black_box(i as f64 * 1.1),
-                black_box(tags.clone()),
-            )
-            .unwrap();
-            i += 1;
-        })
-    });
-}
-
-// Benchmark for querying data
-fn bench_query(c: &mut Criterion) {
-    let config = create_db_config(Duration::from_millis(100)); // Faster flush for setup
-    let db = DbCore::with_config(config).unwrap();
-    
-    let wal_status = if is_nowal_enabled() { "disabled" } else { "enabled" };
-    println!("Running query benchmark with WAL {}", wal_status);
-    
-    let series_name = "bench_query_series";
-    let num_points = 100_000;
-    let tags = tags_from(&[("host", "query_server"), ("dc", "dc1")]);
-
-    // Pre-populate data
-    println!("Setting up data for query benchmark...");
-    for i in 0..num_points {
-        db.insert(series_name, i, i as f64 * 0.9, tags.clone())
-            .unwrap();
+    #[derive(Debug)]
+    struct Fixture {
+        _dir: TempDir,
+        db: DbCore,
     }
-    db.flush().unwrap();
-    std::thread::sleep(Duration::from_secs(2)); // Ensure flush completes
-    println!("Data setup complete.");
 
-    let query_range = 50_000..(num_points - 10_000); // Query a large middle chunk
-    let filter_tags = tags_from(&[("dc", "dc1")]);
+    let mut group = c.benchmark_group("ingest");
 
-    let mut group = c.benchmark_group("query_operations");
-
-    group.bench_function("query_range_no_tags", |b| {
-        b.iter(|| {
-            let _ = db.query(
-                black_box(series_name),
-                black_box(query_range.clone()),
-                black_box(None),
+    for (name, enable_wal) in [("wal_enabled", true), ("wal_disabled", false)] {
+        group.bench_function(format!("ingest_20k_{}", name), |b| {
+            b.iter_batched(
+                || {
+                    let dir = TempDir::new().expect("tempdir");
+                    let cfg = make_config(dir.path(), enable_wal);
+                    let db = DbCore::with_config(cfg).expect("db init");
+                    Fixture { _dir: dir, db }
+                },
+                |fx| {
+                    for op in &ops {
+                        fx.db
+                            .insert(
+                                black_box(&op.series),
+                                black_box(op.ts),
+                                black_box(op.val),
+                                black_box(op.tags.clone()),
+                            )
+                            .unwrap();
+                    }
+                    fx.db.flush().unwrap();
+                },
+                BatchSize::LargeInput,
             )
-            .unwrap();
-        })
-    });
-
-    group.bench_function("query_range_with_tags", |b| {
-        b.iter(|| {
-            let _ = db.query(
-                black_box(series_name),
-                black_box(query_range.clone()),
-                black_box(Some(&filter_tags)),
-            )
-            .unwrap();
-        })
-    });
+        });
+    }
 
     group.finish();
 }
 
-// Cleanup function that runs after all benchmarks
-fn cleanup(_c: &mut Criterion) {
-    println!("Cleaning up benchmark data directory...");
-    let _ = fs::remove_dir_all(PathBuf::from("./data"));
-    println!("Cleanup complete.");
+fn bench_query_fixed_dataset(c: &mut Criterion) {
+    let ops = datasets::generate_insert_ops(datasets::DEFAULT_SEED, 120_000, 64, 4, 16);
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut cfg = make_config(dir.path(), true);
+    cfg.enable_wal = false; // keep query setup fast + deterministic
+
+    let db = DbCore::with_config(cfg).expect("db init");
+    for op in &ops {
+        db.insert(&op.series, op.ts, op.val, op.tags.clone()).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Query a stable slice of one series.
+    let series = "series_7";
+    let range = 40_000u64..90_000u64;
+
+    // Deterministic filter: "k0=v0" matches ~1/16 of points.
+    let mut filter: TagSet = TagSet::new();
+    filter.insert("k0".to_string(), "v0".to_string());
+
+    let mut group = c.benchmark_group("query");
+    group.bench_function("range_no_tags", |b| {
+        b.iter(|| {
+            let _ = db
+                .query(black_box(series), black_box(range.clone()), black_box(None))
+                .unwrap();
+        })
+    });
+    group.bench_function("range_with_tag_filter", |b| {
+        b.iter(|| {
+            let _ = db
+                .query(black_box(series), black_box(range.clone()), black_box(Some(&filter)))
+                .unwrap();
+        })
+    });
+    group.finish();
 }
 
-criterion_group!(benches, bench_insert_single, bench_query, cleanup);
+criterion_group!(benches, bench_ingest_fixed_dataset, bench_query_fixed_dataset);
 criterion_main!(benches);
 

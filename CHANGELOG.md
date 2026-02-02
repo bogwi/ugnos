@@ -5,6 +5,23 @@ All notable changes to the Rust Time-Series Database Core will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.2] - 2026-02-02
+
+### Added
+- Production metrics scaffolding via `metrics` with Prometheus in-process scraping (no server) through `telemetry::db_metrics::InProcessPrometheus`.
+- Metrics for ingest throughput and flush latency (`ugnos_ingest_points`, `ugnos_flush_duration_seconds`, `ugnos_flush_end_to_end_duration_seconds`).
+- Metrics for WAL fsync time and logical bytes written (`ugnos_wal_fsync_duration_seconds`, `ugnos_wal_bytes_written`).
+- Metrics for snapshot size/time (`ugnos_snapshot_size_bytes`, `ugnos_snapshot_duration_seconds`).
+- Deterministic dataset generators (fixed seeds) for stable, comparable benchmarks.
+- Deterministic microbench suite using `iai-callgrind` (CI-friendly, instruction-count based).
+- CI workflow that runs microbench suite and regression gates with configurable thresholds.
+
+### Changed
+- Criterion benchmarks are now deterministic and self-contained (fixed-seed datasets + temp dirs; no shared `./data`).
+- Prometheus exporter is now feature-gated (`prometheus`, enabled by default) so consumers can disable it while retaining the `metrics` facade instrumentation.
+
 ## [Released]
 
 ## [0.2.1] - 2026-02-01
@@ -27,8 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - Direct stdout/stderr logging from core runtime paths.
-
-## [Unreleased]
 
 ## [0.1.1] - 2025-05-11
 
