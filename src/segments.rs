@@ -25,6 +25,12 @@ const FOOTER_LEN: u64 = 8 + 8 + 8 + 4; // magic + index_off + index_len + crc32
 pub struct SegmentStoreConfig {
     pub compaction_check_interval: Duration,
     pub l0_compaction_trigger_segment_count: usize,
+    /// Optional trigger: compact L0 when total bytes across all L0 segments reaches/exceeds this value.
+    ///
+    /// Note: bytes are computed from on-disk file sizes (best-effort).
+    pub l0_compaction_trigger_total_bytes: Option<u64>,
+    /// Optional trigger: compact L0 when the oldest L0 segment age reaches/exceeds this value.
+    pub l0_compaction_trigger_max_age: Option<Duration>,
 }
 
 impl Default for SegmentStoreConfig {
@@ -32,6 +38,8 @@ impl Default for SegmentStoreConfig {
         Self {
             compaction_check_interval: Duration::from_secs(1),
             l0_compaction_trigger_segment_count: 4,
+            l0_compaction_trigger_total_bytes: None,
+            l0_compaction_trigger_max_age: None,
         }
     }
 }
@@ -179,13 +187,18 @@ impl SegmentStore {
     /// This makes retention effective immediately for reads, and compaction will later
     /// physically drop the data.
     pub fn advance_delete_before(&self, delete_before: Timestamp) -> Result<(), DbError> {
-        let mut st = self.state.write()?;
-        let cur = st.manifest.delete_before.unwrap_or(0);
-        if delete_before <= cur {
-            return Ok(());
+        {
+            let mut st = self.state.write()?;
+            let cur = st.manifest.delete_before.unwrap_or(0);
+            if delete_before <= cur {
+                return Ok(());
+            }
+            st.manifest.delete_before = Some(delete_before);
+            write_manifest_atomic(&self.manifest_path, &self.tmp_dir, &st.manifest)?;
         }
-        st.manifest.delete_before = Some(delete_before);
-        write_manifest_atomic(&self.manifest_path, &self.tmp_dir, &st.manifest)?;
+
+        // Nudge the background compaction/reclaim loop so TTL advances lead to timely reclamation.
+        let _ = self.compaction_tx.send(CompactionCmd::Maybe);
         Ok(())
     }
 
@@ -204,14 +217,8 @@ impl SegmentStore {
 
         let created_at = now_ns();
 
-        // Assign id and create filename under manifest lock.
-        let (id, delete_before) = {
-            let mut st = self.state.write()?;
-            let id = st.manifest.next_segment_id;
-            st.manifest.next_segment_id = st.manifest.next_segment_id.saturating_add(1);
-            let delete_before = st.manifest.delete_before;
-            (id, delete_before)
-        };
+        // Read the current retention watermark first so we can filter without allocating an id.
+        let delete_before = { self.state.read()?.manifest.delete_before };
 
         // Apply retention to newly created segments too (prevents reintroducing expired data).
         let delete_before_ts = delete_before.unwrap_or(0);
@@ -221,9 +228,18 @@ impl SegmentStore {
             }
             rows_by_series.retain(|_, rows| !rows.is_empty());
             if rows_by_series.is_empty() {
-                return Err(DbError::Internal("Refusing to write an empty segment after retention filter".to_string()));
+                // Nothing survives retention; treat as a no-op (do not error the flush/recovery path).
+                return Ok(());
             }
         }
+
+        // Assign id under manifest lock.
+        let id = {
+            let mut st = self.state.write()?;
+            let id = st.manifest.next_segment_id;
+            st.manifest.next_segment_id = st.manifest.next_segment_id.saturating_add(1);
+            id
+        };
 
         let file_name = format!("seg_{:020}_l0.seg", id);
         let final_path = self.segments_dir.join(&file_name);
@@ -361,13 +377,164 @@ fn maybe_compact(
     manifest_path: &Path,
     cfg: &SegmentStoreConfig,
 ) -> Result<(), DbError> {
-    let l0_count = {
+    // Retention reclamation is correctness-agnostic (queries already obey tombstone), but critical for
+    // enterprise operational guarantees: eventually reclaim disk for expired data even if no new
+    // flushes/compactions happen and even if only a single segment exists.
+    reclaim_retention(state, segments_dir, tmp_dir, manifest_path)?;
+
+    let (l0, l0_total_bytes, oldest_created_at) = {
         let st = state.read()?;
-        st.active.iter().filter(|s| s.rec.level == 0).count()
+        let l0: Vec<_> = st.active.iter().filter(|s| s.rec.level == 0).cloned().collect();
+        let oldest = l0.iter().map(|s| s.rec.created_at).min();
+        let mut total = 0u64;
+        for seg in &l0 {
+            total = total.saturating_add(fs::metadata(&seg.path).map(|m| m.len()).unwrap_or(0));
+        }
+        (l0, total, oldest)
     };
-    if l0_count >= cfg.l0_compaction_trigger_segment_count {
+
+    let mut should_compact = false;
+    if l0.len() >= cfg.l0_compaction_trigger_segment_count {
+        should_compact = true;
+    }
+    if let Some(bytes) = cfg.l0_compaction_trigger_total_bytes {
+        if l0_total_bytes >= bytes {
+            should_compact = true;
+        }
+    }
+    if let Some(max_age) = cfg.l0_compaction_trigger_max_age {
+        if let Some(oldest) = oldest_created_at {
+            let age = Duration::from_nanos(now_ns().saturating_sub(oldest));
+            if age >= max_age {
+                should_compact = true;
+            }
+        }
+    }
+
+    // L0 compaction is a merge; require at least two segments.
+    if should_compact && l0.len() >= 2 {
         let _ = compact_l0_once(state, segments_dir, tmp_dir, manifest_path)?;
     }
+    Ok(())
+}
+
+fn reclaim_retention(
+    state: &Arc<RwLock<StoreState>>,
+    segments_dir: &Path,
+    tmp_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), DbError> {
+    let (delete_before, segments) = {
+        let st = state.read()?;
+        let delete_before = st.manifest.delete_before.unwrap_or(0);
+        if delete_before == 0 {
+            return Ok(());
+        }
+        (delete_before, st.active.clone())
+    };
+
+    // Identify segments that are fully expired or partially overlapping the watermark.
+    let mut fully_expired: Vec<Arc<Segment>> = Vec::new();
+    let mut partial: Vec<Arc<Segment>> = Vec::new();
+    for seg in segments {
+        if seg.rec.max_ts < delete_before {
+            fully_expired.push(seg);
+        } else if seg.rec.min_ts < delete_before {
+            partial.push(seg);
+        }
+    }
+
+    // Rewrite partially expired segments one-by-one so their persisted metadata reflects the watermark.
+    for seg in partial {
+        let mut filtered: HashMap<String, Vec<Row>> = HashMap::new();
+        for (series, meta) in &seg.rec.series {
+            // Fast path: entire series is expired.
+            if meta.max_ts < delete_before {
+                continue;
+            }
+            let mut rows = read_series_all_rows(&seg.path, meta)?;
+            rows.retain(|r| r.timestamp >= delete_before);
+            if rows.is_empty() {
+                continue;
+            }
+            rows.sort_unstable_by(|a, b| (a.timestamp, a.seq).cmp(&(b.timestamp, b.seq)));
+            filtered.insert(series.clone(), rows);
+        }
+
+        if filtered.is_empty() {
+            fully_expired.push(seg);
+            continue;
+        }
+
+        // Allocate a new id for the rewritten segment.
+        let new_id = {
+            let mut st = state.write()?;
+            let id = st.manifest.next_segment_id;
+            st.manifest.next_segment_id = st.manifest.next_segment_id.saturating_add(1);
+            id
+        };
+        let created_at = now_ns();
+        let level = seg.rec.level;
+
+        let file_name = format!("seg_{:020}_l{}.seg", new_id, level);
+        let final_path = segments_dir.join(&file_name);
+        let tmp_path = tmp_dir.join(format!("{}.tmp", &file_name));
+
+        let new_rec = write_segment_file(
+            &tmp_path,
+            &final_path,
+            new_id,
+            level,
+            created_at,
+            Some(delete_before),
+            filtered,
+        )?;
+
+        // Atomically replace the segment in manifest + active set.
+        {
+            let mut st = state.write()?;
+
+            st.manifest.segments.retain(|r| r.id != seg.rec.id);
+            st.manifest.segments.push(new_rec.clone());
+            write_manifest_atomic(manifest_path, tmp_dir, &st.manifest)?;
+
+            let mut new_active = Vec::with_capacity(st.active.len() + 1);
+            let mut new_obsolete = Vec::new();
+            for s in st.active.drain(..) {
+                if s.rec.id == seg.rec.id {
+                    new_obsolete.push(s);
+                } else {
+                    new_active.push(s);
+                }
+            }
+            st.obsolete.extend(new_obsolete);
+            new_active.push(Arc::new(Segment { rec: new_rec.clone(), path: final_path }));
+            st.active = new_active;
+        }
+    }
+
+    if !fully_expired.is_empty() {
+        let old_ids: std::collections::HashSet<u64> = fully_expired.iter().map(|s| s.rec.id).collect();
+        {
+            let mut st = state.write()?;
+            st.manifest.segments.retain(|r| !old_ids.contains(&r.id));
+            write_manifest_atomic(manifest_path, tmp_dir, &st.manifest)?;
+
+            let mut new_active = Vec::with_capacity(st.active.len());
+            let mut new_obsolete = Vec::new();
+            for s in st.active.drain(..) {
+                if old_ids.contains(&s.rec.id) {
+                    new_obsolete.push(s);
+                } else {
+                    new_active.push(s);
+                }
+            }
+            st.obsolete.extend(new_obsolete);
+            st.active = new_active;
+        }
+    }
+
+    reap_obsolete(state)?;
     Ok(())
 }
 
@@ -410,6 +577,30 @@ fn compact_l0_once(
         rows.sort_unstable_by(|a, b| (a.timestamp, a.seq).cmp(&(b.timestamp, b.seq)));
     }
     merged.retain(|_, rows| !rows.is_empty());
+
+    // If retention removes everything, delete the input segments without producing an output segment.
+    if merged.is_empty() {
+        let old_ids: std::collections::HashSet<u64> = to_compact.iter().map(|s| s.rec.id).collect();
+        {
+            let mut st = state.write()?;
+            st.manifest.segments.retain(|r| !old_ids.contains(&r.id));
+            write_manifest_atomic(manifest_path, tmp_dir, &st.manifest)?;
+
+            let mut new_active = Vec::with_capacity(st.active.len());
+            let mut new_obsolete = Vec::new();
+            for seg in st.active.drain(..) {
+                if old_ids.contains(&seg.rec.id) {
+                    new_obsolete.push(seg);
+                } else {
+                    new_active.push(seg);
+                }
+            }
+            st.obsolete.extend(new_obsolete);
+            st.active = new_active;
+        }
+        reap_obsolete(state)?;
+        return Ok(CompactionStats { input_segments: to_compact.len(), output_segments: 0 });
+    }
 
     // Allocate new id and write output segment.
     let (new_id, created_at) = {

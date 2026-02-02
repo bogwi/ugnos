@@ -33,6 +33,8 @@ jobs:
         run: cargo test --release --test microbench_regressions -- --ignored
       - name: Install Valgrind (for iai-callgrind microbench suite)
         run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Install iai-callgrind-runner (for iai-callgrind microbench suite)
+        run: cargo install --locked --version 0.16.1 iai-callgrind-runner
       - name: Run deterministic microbench suite (iai-callgrind)
         run: cargo bench --bench microbench_iai
 

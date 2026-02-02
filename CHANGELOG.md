@@ -5,7 +5,26 @@ All notable changes to the Rust Time-Series Database Core will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Released]
+
+## [0.3.0] - 2026-02-02
+
+### Added
+- Segment-store compaction triggers based on **total L0 bytes** and **L0 max age** (in addition to segment-count).
+- Retention **physical reclamation** via background rewrite/removal of expired-on-disk data (works for single segments and L1 segments).
+- “Break it” tests covering retention physical reclamation and the new size/time compaction triggers.
+
+*Note: this feature was implemented yet in 18be8bbdd5ff3753e4b5fb3635d02a29f2a4d579. Now it was hardened and tested additionally.*
+
+### Changed
+- Advancing the retention tombstone watermark now nudges the background compaction/reclaim loop for timely disk reclamation.
+- Segment ingest applies the retention watermark up-front and treats “all data expired” as a no-op instead of an error.
+
+### Fixed
+- L0 compaction now handles “retention removed everything” by deleting input segments without producing an empty output segment.
+
+### Removed
+- N/A
 
 ## [0.2.3] - 2026-02-02
 
