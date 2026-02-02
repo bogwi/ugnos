@@ -1,15 +1,4 @@
-#![doc = r#"
-ugnos: Concurrent Time-Series Database Core in Rust
-
-This crate provides a high-performance, concurrent time-series database core for Rust applications. It is designed for efficient ingestion, storage, and querying of large volumes of time-stamped data, with support for:
-- Concurrent write buffering and background flushing
-- Columnar in-memory storage
-- Write-Ahead Log (WAL) and snapshot-based persistence
-- Tag-based filtering and time range queries
-- Thread-safe architecture
-
-See the README for usage examples and more details.
-"#]
+#![doc = include_str!("../README.md")]
 // Declare modules
 pub mod buffer;
 pub mod core;

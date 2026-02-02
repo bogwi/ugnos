@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-02-02
+
+### Added
+- README is now the crate-level documentation, and all README Rust snippets are exercised as rustdoc doc-tests during `cargo test`.
+- Clear “what this is / what this is not (yet)” positioning in the README.
+
+### Changed
+- README code examples are now deterministic and CI-safe (use temp dirs and `no_run` to avoid filesystem side-effects and flaky runtime behavior).
+
 ## [0.2.2] - 2026-02-02
 
 ### Added

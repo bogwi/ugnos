@@ -4,6 +4,19 @@
 
 For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md).
 
+## What this is / what this is not (yet)
+
+This crate is a **library-grade database core** intended to be embedded into a Rust process (service/agent/daemon).
+
+- **This is**:
+  - An embeddable time-series ingest + query core with WAL/snapshots/segments (SST-like) and a structured event hook.
+  - Suitable for single-process usage where you own deployment, IO, and operational integration.
+- **This is not (yet)**:
+  - A networked database server (no HTTP/gRPC API, authn/authz, multi-tenant isolation).
+  - A distributed system (no replication, consensus, sharding across nodes).
+  - A full query language / SQL layer (queries are programmatic APIs).
+  - A turnkey operational product (no built-in backup orchestration, migrations tooling, or admin UI).
+
 ## Features (today)
 
 - **Concurrent ingest**: sharded write buffering + background flush thread.
@@ -47,14 +60,16 @@ All persistence lives under `DbConfig.data_dir`:
 
 `DbConfig` is intended to be explicit and production-friendly:
 
-```rust
+```rust,no_run
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tempfile::TempDir;
 use ugnos::{DbConfig, DbCore};
 
+let dir = TempDir::new().unwrap();
 let mut cfg = DbConfig::default();
-cfg.data_dir = PathBuf::from("./data");
+cfg.data_dir = PathBuf::from(dir.path());
 
 // Durability toggles
 cfg.enable_wal = true;
@@ -78,7 +93,7 @@ db.recover().unwrap();
 
 Core emits structured events via `DbConfig.event_listener`:
 
-```rust
+```rust,no_run
 use std::sync::{Arc, Mutex};
 use ugnos::{DbEvent, DbEventListener};
 
@@ -94,11 +109,12 @@ impl DbEventListener for MemoryEvents {
 
 ## Basic usage
 
-```rust
+```rust,no_run
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tempfile::TempDir;
 use ugnos::{DbConfig, DbCore, DbEvent, DbEventListener, TagSet};
 
 #[derive(Debug)]
@@ -113,8 +129,9 @@ impl DbEventListener for MemoryEvents {
 fn main() -> Result<(), ugnos::DbError> {
     let events = Arc::new(Mutex::new(Vec::new()));
 
+    let dir = TempDir::new().unwrap();
     let mut cfg = DbConfig::default();
-    cfg.data_dir = PathBuf::from("./data");
+    cfg.data_dir = PathBuf::from(dir.path());
     cfg.enable_wal = true;
     cfg.enable_snapshots = true;
     cfg.enable_segments = true;
