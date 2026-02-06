@@ -1,6 +1,6 @@
 [package]
 name = "ugnos"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "A high-performance, concurrent time-series database core written in Rust, designed for efficient IoT data ingestion, real-time analytics, and monitoring."
 license = "MIT OR Apache-2.0"
@@ -55,4 +55,8 @@ harness = false         # Required for iai-callgrind benchmarks
 [[example]]
 name = "persistence_demo"
 path = "examples/persistence_demo.rs"
+
+[[example]]
+name = "encoding_compression_demo"
+path = "examples/encoding_compression_demo.rs"
 

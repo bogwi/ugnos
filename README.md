@@ -24,7 +24,9 @@ This crate is a **library-grade database core** intended to be embedded into a R
   - **WAL** with **explicit format versioning** and **per-record CRC32** checksums.
   - **Snapshots** with **explicit format versioning**, **payload CRC32**, and **atomic install** (temp + rename + fsync).
 - **On-disk segment engine (SST-like)**:
-  - Immutable segment files with per-series columnar blocks + CRC.
+  - Immutable segment files with per-series columnar blocks; **block-level checksums** and **versioning** (v2 header with payload CRC32 and version field).
+  - **Timestamp delta encoding** (varint) for series blocks; configurable float encoding strategies (**Raw64**, **GorillaXor**).
+  - **Tag dictionary encoding**; optional per-block compression (**LZ4**, **Zstd** with configurable level).
   - Atomic manifest (`MANIFEST.bin`) tracking active segments and retention watermark.
   - Background compaction (L0 → L1 merge) with safe concurrent reads.
 - **Retention/TTL**:
@@ -33,6 +35,8 @@ This crate is a **library-grade database core** intended to be embedded into a R
 - **Observability hooks**:
   - No stdout logging in core hot paths.
   - Structured `DbEvent` stream via `DbConfig.event_listener`.
+- **Bench suite** reports segment size per encoding configuration; tests assert p99 query latency within target for encoded/compressed segments.
+- **Acceptance and break-it tests** covering format layout validation, checksum/version enforcement, roundtrip correctness, and corruption detection.
 
 ## Data layout on disk
 
@@ -84,6 +88,10 @@ cfg.snapshot_interval = Duration::from_secs(60 * 15);
 // Retention (optional): makes data older than now - ttl invisible, and compaction reclaims disk.
 cfg.retention_ttl = Some(Duration::from_secs(60 * 60 * 24 * 7));
 cfg.retention_check_interval = Duration::from_secs(1);
+
+// Encoding & compression (series blocks in segments): float (Raw64 | GorillaXor), tag dictionary, LZ4/Zstd.
+cfg.segment_store.encoding.float_encoding = ugnos::encoding::FloatEncoding::GorillaXor;
+cfg.segment_store.encoding.compression = ugnos::encoding::BlockCompression::Zstd { level: 3 };
 
 let mut db = DbCore::with_config(cfg).unwrap();
 db.recover().unwrap();

@@ -14,7 +14,7 @@
 # Dev files
 dev/
 data/
-demo_data/
+demo_*/
 
 # Ugnos files
 *.bin
