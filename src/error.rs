@@ -45,4 +45,3 @@ impl<T> From<std::sync::PoisonError<T>> for DbError {
         DbError::LockError(format!("Mutex/RwLock poisoned: {}", err))
     }
 }
-

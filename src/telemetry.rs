@@ -248,4 +248,3 @@ pub mod db_metrics {
         );
     }
 }
-

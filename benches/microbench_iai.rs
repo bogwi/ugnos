@@ -44,7 +44,12 @@ fn gen_ops(points: usize, series_count: usize, tag_pairs: usize) -> Vec<InsertOp
         let ts = i as u64;
         let val = rng.random::<u32>() as f64 * 0.001;
         let tags = gen_tags(&mut rng, tag_pairs);
-        ops.push(InsertOp { series, ts, val, tags });
+        ops.push(InsertOp {
+            series,
+            ts,
+            val,
+            tags,
+        });
     }
 
     ops
@@ -73,7 +78,12 @@ fn ingest_then_flush(mut fx: Fixture) -> u64 {
     let mut n = 0u64;
     for op in fx.ops.drain(..) {
         fx.db
-            .insert(black_box(&op.series), black_box(op.ts), black_box(op.val), black_box(op.tags))
+            .insert(
+                black_box(&op.series),
+                black_box(op.ts),
+                black_box(op.val),
+                black_box(op.tags),
+            )
             .unwrap();
         n += 1;
     }
@@ -99,4 +109,3 @@ library_benchmark_group!(
 );
 
 main!(library_benchmark_groups = microbench_group);
-

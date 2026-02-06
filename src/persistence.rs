@@ -1,14 +1,14 @@
 use crate::error::DbError;
-use crate::telemetry::db_metrics as db_metrics;
+use crate::telemetry::db_metrics;
 use crate::types::{DataPoint, TagSet, Timestamp, Value};
+use crc32fast::Hasher as Crc32;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use crc32fast::Hasher as Crc32;
-use serde::{Deserialize, Serialize};
 
 const WAL_MAGIC: &[u8; 8] = b"UGNWAL01";
 const WAL_VERSION: u32 = 2;
@@ -50,7 +50,7 @@ impl WriteAheadLog {
     pub fn new<P: AsRef<Path>>(log_dir: P, max_pending_entries: usize) -> Result<Self, DbError> {
         fs::create_dir_all(&log_dir)?;
         let log_dir = log_dir.as_ref().to_path_buf();
-        
+
         let log_path = log_dir.join("wal.log");
         let mut file = OpenOptions::new()
             .create(true)
@@ -103,12 +103,12 @@ impl WriteAheadLog {
 
     /// Logs an insert operation to the WAL
     pub fn log_insert(
-        &mut self, 
+        &mut self,
         seq: u64,
-        series: &str, 
-        timestamp: Timestamp, 
-        value: Value, 
-        tags: TagSet
+        series: &str,
+        timestamp: Timestamp,
+        value: Value,
+        tags: TagSet,
     ) -> Result<(), DbError> {
         let entry = WalEntry::Insert {
             seq,
@@ -117,14 +117,14 @@ impl WriteAheadLog {
             value,
             tags,
         };
-        
+
         self.pending_entries.push(entry);
-        
+
         // If we've reached the maximum number of pending entries, flush to disk
         if self.pending_entries.len() >= self.max_pending_entries {
             self.flush_to_disk()?;
         }
-        
+
         Ok(())
     }
 
@@ -133,14 +133,15 @@ impl WriteAheadLog {
         if self.pending_entries.is_empty() {
             return Ok(());
         }
-        
+
         if let Some(log_file) = &mut self.log_file {
             let mut bytes_written: u64 = 0;
             for entry in &self.pending_entries {
                 match self.format_version {
                     2 => {
                         let payload = encode_wal_record_v2(entry)?;
-                        bytes_written = bytes_written.saturating_add(8_u64.saturating_add(payload.len() as u64)); // len(u32)+crc(u32)+payload
+                        bytes_written = bytes_written
+                            .saturating_add(8_u64.saturating_add(payload.len() as u64)); // len(u32)+crc(u32)+payload
                         let mut hasher = Crc32::new();
                         hasher.update(&payload);
                         let crc = hasher.finalize();
@@ -153,45 +154,46 @@ impl WriteAheadLog {
                     _ => {
                         let serialized = bincode::serialize(entry)
                             .map_err(|e| DbError::Serialization(e.to_string()))?;
-                        bytes_written = bytes_written.saturating_add(4_u64.saturating_add(serialized.len() as u64)); // len(u32)+payload
+                        bytes_written = bytes_written
+                            .saturating_add(4_u64.saturating_add(serialized.len() as u64)); // len(u32)+payload
                         let len = serialized.len() as u32;
                         log_file.write_all(&len.to_le_bytes())?;
                         log_file.write_all(&serialized)?;
                     }
                 }
             }
-            
+
             // Ensure it's written to disk
             log_file.flush()?;
             let sync_started = Instant::now();
             log_file.get_ref().sync_data()?;
             db_metrics::record_wal_fsync(sync_started.elapsed());
             db_metrics::record_wal_bytes_written(bytes_written);
-            
+
             // Clear pending entries
             self.pending_entries.clear();
-            
+
             Ok(())
         } else {
             Err(DbError::Internal("WAL file not initialized".to_string()))
         }
     }
-    
+
     /// Records a flush operation in the WAL
     pub fn log_flush(&mut self, timestamp: Timestamp) -> Result<(), DbError> {
         let entry = WalEntry::Flush { timestamp };
         self.pending_entries.push(entry);
         self.flush_to_disk()
     }
-    
+
     /// Closes the WAL file
     pub fn close(&mut self) -> Result<(), DbError> {
         // Flush any pending entries
         self.flush_to_disk()?;
-        
+
         // Close the file
         self.log_file = None;
-        
+
         Ok(())
     }
 
@@ -272,7 +274,7 @@ impl WriteAheadLog {
         }
         Ok(out)
     }
-    
+
     /// Reads all entries from the current WAL file (`wal.log`).
     pub fn read_all_entries(&self) -> Result<Vec<WalEntry>, DbError> {
         read_entries_from_path(&self.log_path)
@@ -281,7 +283,8 @@ impl WriteAheadLog {
 
 fn write_wal_header(file: &mut File, version: u32) -> Result<(), DbError> {
     file.write_all(WAL_MAGIC).map_err(DbError::Io)?;
-    file.write_all(&version.to_le_bytes()).map_err(DbError::Io)?;
+    file.write_all(&version.to_le_bytes())
+        .map_err(DbError::Io)?;
     file.flush().map_err(DbError::Io)?;
     let sync_started = Instant::now();
     file.sync_data().map_err(DbError::Io)?;
@@ -323,17 +326,26 @@ fn detect_wal_version(path: &Path) -> Result<Option<u32>, DbError> {
 fn encode_wal_record_v2(entry: &WalEntry) -> Result<Vec<u8>, DbError> {
     let mut buf = Vec::new();
     match entry {
-        WalEntry::Insert { seq, series, timestamp, value, tags } => {
+        WalEntry::Insert {
+            seq,
+            series,
+            timestamp,
+            value,
+            tags,
+        } => {
             buf.push(WAL_REC_INSERT);
             buf.extend_from_slice(&seq.to_le_bytes());
             buf.extend_from_slice(&timestamp.to_le_bytes());
             let s = series.as_bytes();
-            let slen = u32::try_from(s.len()).map_err(|_| DbError::Internal("Series name too large".to_string()))?;
+            let slen = u32::try_from(s.len())
+                .map_err(|_| DbError::Internal("Series name too large".to_string()))?;
             buf.extend_from_slice(&slen.to_le_bytes());
             buf.extend_from_slice(s);
             buf.extend_from_slice(&value.to_le_bytes());
-            let tags_bytes = bincode::serialize(tags).map_err(|e| DbError::Serialization(e.to_string()))?;
-            let tlen = u32::try_from(tags_bytes.len()).map_err(|_| DbError::Internal("Tags blob too large".to_string()))?;
+            let tags_bytes =
+                bincode::serialize(tags).map_err(|e| DbError::Serialization(e.to_string()))?;
+            let tlen = u32::try_from(tags_bytes.len())
+                .map_err(|_| DbError::Internal("Tags blob too large".to_string()))?;
             buf.extend_from_slice(&tlen.to_le_bytes());
             buf.extend_from_slice(&tags_bytes);
         }
@@ -405,7 +417,13 @@ fn decode_wal_record_v2(payload: &[u8]) -> Result<WalEntry, String> {
             cur.read_exact(&mut tb).map_err(|e| e.to_string())?;
             let tags: TagSet = bincode::deserialize(&tb).map_err(|e| e.to_string())?;
 
-            Ok(WalEntry::Insert { seq, series, timestamp, value, tags })
+            Ok(WalEntry::Insert {
+                seq,
+                series,
+                timestamp,
+                value,
+                tags,
+            })
         }
         WAL_REC_FLUSH => {
             let mut b8 = [0u8; 8];
@@ -521,12 +539,12 @@ impl Snapshotter {
     pub fn new<P: AsRef<Path>>(snapshot_dir: P) -> Result<Self, DbError> {
         let dir_path = snapshot_dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir_path)?;
-        
+
         Ok(Snapshotter {
             snapshot_dir: dir_path,
         })
     }
-    
+
     /// Creates a snapshot of the database state
     pub fn create_snapshot(
         &self,
@@ -548,9 +566,9 @@ impl Snapshotter {
             payload.extend_from_slice(&name_len.to_le_bytes());
             payload.extend_from_slice(name_bytes);
 
-            let chunk_arc = series_data
-                .get(series_name)
-                .ok_or_else(|| DbError::Internal("Snapshot series map mutated during snapshot".to_string()))?;
+            let chunk_arc = series_data.get(series_name).ok_or_else(|| {
+                DbError::Internal("Snapshot series map mutated during snapshot".to_string())
+            })?;
             let chunk = chunk_arc.read().map_err(|e| {
                 DbError::LockError(format!("Failed to acquire read lock on chunk: {}", e))
             })?;
@@ -588,8 +606,12 @@ impl Snapshotter {
         let crc = hasher.finalize();
 
         // Atomic install: write to temp, fsync, rename, fsync dir.
-        let final_path = self.snapshot_dir.join(format!("snapshot_{}.bin", timestamp));
-        let tmp_path = self.snapshot_dir.join(format!(".tmp_snapshot_{}.bin", timestamp));
+        let final_path = self
+            .snapshot_dir
+            .join(format!("snapshot_{}.bin", timestamp));
+        let tmp_path = self
+            .snapshot_dir
+            .join(format!(".tmp_snapshot_{}.bin", timestamp));
 
         let file = OpenOptions::new()
             .create(true)
@@ -613,7 +635,7 @@ impl Snapshotter {
         db_metrics::record_snapshot(started.elapsed(), size);
         Ok(final_path)
     }
-    
+
     /// Loads the latest snapshot
     pub fn load_latest_snapshot(&self) -> Result<Option<HashMap<String, Vec<DataPoint>>>, DbError> {
         let mut snaps = list_snapshots(&self.snapshot_dir)?;
@@ -641,7 +663,10 @@ impl Snapshotter {
         let version = u32::from_le_bytes(v);
         if version != SNAP_VERSION {
             return Err(DbError::Corruption {
-                details: format!("Unsupported snapshot version {} in {:?}", version, latest_path),
+                details: format!(
+                    "Unsupported snapshot version {} in {:?}",
+                    version, latest_path
+                ),
                 series: None,
                 timestamp: None,
             });
@@ -672,84 +697,86 @@ impl Snapshotter {
         let mut series_count_bytes = [0u8; 4];
         cur.read_exact(&mut series_count_bytes)?;
         let series_count = u32::from_le_bytes(series_count_bytes) as usize;
-        
+
         let mut result = HashMap::with_capacity(series_count);
-        
+
         // Read each series
         for _ in 0..series_count {
             // Read series name
             let mut name_len_bytes = [0u8; 4];
             cur.read_exact(&mut name_len_bytes)?;
             let name_len = u32::from_le_bytes(name_len_bytes) as usize;
-            
+
             let mut name_bytes = vec![0u8; name_len];
             cur.read_exact(&mut name_bytes)?;
             let series_name = String::from_utf8(name_bytes)
                 .map_err(|e| DbError::Internal(format!("Invalid UTF-8 in series name: {}", e)))?;
-            
+
             // Read point count
             let mut point_count_bytes = [0u8; 4];
             cur.read_exact(&mut point_count_bytes)?;
             let point_count = u32::from_le_bytes(point_count_bytes) as usize;
-            
+
             let mut points = Vec::with_capacity(point_count);
-            
+
             // Read all data points
             for _ in 0..point_count {
                 // Read timestamp
                 let mut ts_bytes = [0u8; 8];
                 cur.read_exact(&mut ts_bytes)?;
                 let timestamp = u64::from_le_bytes(ts_bytes);
-                
+
                 // Read value
                 let mut val_bytes = [0u8; 8];
                 cur.read_exact(&mut val_bytes)?;
                 let value = f64::from_le_bytes(val_bytes);
-                
+
                 // Read tags
                 let mut tags_count_bytes = [0u8; 4];
                 cur.read_exact(&mut tags_count_bytes)?;
                 let tags_count = u32::from_le_bytes(tags_count_bytes) as usize;
-                
+
                 let mut tags = HashMap::with_capacity(tags_count);
-                
+
                 for _ in 0..tags_count {
                     // Read key
                     let mut key_len_bytes = [0u8; 4];
                     cur.read_exact(&mut key_len_bytes)?;
                     let key_len = u32::from_le_bytes(key_len_bytes) as usize;
-                    
+
                     let mut key_bytes = vec![0u8; key_len];
                     cur.read_exact(&mut key_bytes)?;
-                    let key = String::from_utf8(key_bytes)
-                        .map_err(|e| DbError::Internal(format!("Invalid UTF-8 in tag key: {}", e)))?;
-                    
+                    let key = String::from_utf8(key_bytes).map_err(|e| {
+                        DbError::Internal(format!("Invalid UTF-8 in tag key: {}", e))
+                    })?;
+
                     // Read value
                     let mut value_len_bytes = [0u8; 4];
                     cur.read_exact(&mut value_len_bytes)?;
                     let value_len = u32::from_le_bytes(value_len_bytes) as usize;
-                    
+
                     let mut value_bytes = vec![0u8; value_len];
                     cur.read_exact(&mut value_bytes)?;
-                    let value = String::from_utf8(value_bytes)
-                        .map_err(|e| DbError::Internal(format!("Invalid UTF-8 in tag value: {}", e)))?;
-                    
+                    let value = String::from_utf8(value_bytes).map_err(|e| {
+                        DbError::Internal(format!("Invalid UTF-8 in tag value: {}", e))
+                    })?;
+
                     tags.insert(key, value);
                 }
-                
+
                 points.push(DataPoint {
                     timestamp,
                     value,
                     tags,
                 });
             }
-            
+
             result.insert(series_name, points);
         }
-        
+
         Ok(Some(result))
     }
-    
+
     /// Finds the latest snapshot timestamp
     pub fn get_latest_snapshot_timestamp(&self) -> Result<Option<Timestamp>, DbError> {
         let mut snaps = list_snapshots(&self.snapshot_dir)?;
@@ -770,7 +797,9 @@ fn list_snapshots(dir: &Path) -> Result<Vec<(Timestamp, PathBuf)>, DbError> {
             .strip_prefix("snapshot_")
             .and_then(|s| s.strip_suffix(".bin"));
         let Some(ts_str) = ts_part else { continue };
-        let Ok(ts) = ts_str.parse::<u64>() else { continue };
+        let Ok(ts) = ts_str.parse::<u64>() else {
+            continue;
+        };
         out.push((ts, entry.path()));
     }
     Ok(out)
@@ -779,11 +808,11 @@ fn list_snapshots(dir: &Path) -> Result<Vec<(Timestamp, PathBuf)>, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::types::TimeSeriesChunk;
     use std::fs;
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
-    use crate::types::TimeSeriesChunk;
 
     // Helper function to get current timestamp in nanoseconds
     fn get_current_timestamp() -> Timestamp {
@@ -817,203 +846,226 @@ mod tests {
         // Create a temporary directory for the WAL
         let temp_dir = tempdir().unwrap();
         let wal_dir = temp_dir.path().join("wal");
-        
+
         // Create WAL with small buffer
         let mut wal = WriteAheadLog::new(&wal_dir, 3).unwrap();
-        
+
         // Insert test data with real timestamps
         let ts1 = get_current_timestamp();
         thread::sleep(std::time::Duration::from_nanos(1));
         let ts2 = get_current_timestamp();
         thread::sleep(std::time::Duration::from_nanos(1));
         let ts3 = get_current_timestamp();
-        
+
         let tags1 = create_tags(&[("host", "server1"), ("region", "us-east")]);
         let tags2 = create_tags(&[("host", "server2"), ("region", "us-west")]);
-        
+
         // Log inserts
-        wal.log_insert(1, "series1", ts1, 1.0, tags1.clone()).unwrap();
-        wal.log_insert(2, "series1", ts2, 2.0, tags1.clone()).unwrap();
-        
+        wal.log_insert(1, "series1", ts1, 1.0, tags1.clone())
+            .unwrap();
+        wal.log_insert(2, "series1", ts2, 2.0, tags1.clone())
+            .unwrap();
+
         // Verify pending entries (not yet flushed)
         assert_eq!(wal.pending_entries.len(), 2);
-        
+
         // This should trigger auto-flush (max_pending_entries = 3)
-        wal.log_insert(3, "series2", ts3, 3.0, tags2.clone()).unwrap();
-        
+        wal.log_insert(3, "series2", ts3, 3.0, tags2.clone())
+            .unwrap();
+
         // Verify flush occurred (pending entries cleared)
         assert_eq!(wal.pending_entries.len(), 0);
-        
+
         // Log flush event
         let flush_ts = get_current_timestamp();
         wal.log_flush(flush_ts).unwrap();
-        
+
         // Explicitly close the WAL
         wal.close().unwrap();
-        
+
         // Create a new WAL instance to read the log
         let wal2 = WriteAheadLog::new(&wal_dir, 3).unwrap();
         let entries = wal2.read_all_entries().unwrap();
-        
+
         // Verify all entries are present
         assert_eq!(entries.len(), 4); // 3 inserts + 1 flush
-        
+
         // Verify specific entries
         match &entries[0] {
-            WalEntry::Insert { seq, series, timestamp, value, tags } => {
+            WalEntry::Insert {
+                seq,
+                series,
+                timestamp,
+                value,
+                tags,
+            } => {
                 assert_eq!(*seq, 1);
                 assert_eq!(series, "series1");
                 assert_eq!(*timestamp, ts1);
                 assert_eq!(*value, 1.0);
                 assert_eq!(*tags, tags1);
-            },
+            }
             _ => panic!("Expected Insert entry"),
         }
-        
+
         match &entries[3] {
             WalEntry::Flush { timestamp } => {
                 assert_eq!(*timestamp, flush_ts);
-            },
+            }
             _ => panic!("Expected Flush entry"),
         }
     }
-    
+
     #[test]
     fn test_wal_empty_flush() {
         let temp_dir = tempdir().unwrap();
         let wal_dir = temp_dir.path().join("wal");
-        
+
         let mut wal = WriteAheadLog::new(&wal_dir, 10).unwrap();
-        
+
         // Flush with no pending entries
         wal.flush_to_disk().unwrap();
-        
+
         // Should not create any entries
         let entries = wal.read_all_entries().unwrap();
         assert_eq!(entries.len(), 0);
     }
-    
+
     #[test]
     fn test_snapshotter_create_and_load() {
         // Create a temporary directory for snapshots
         let temp_dir = tempdir().unwrap();
         let snapshot_dir = temp_dir.path().join("snapshots");
-        
+
         // Create a Snapshotter
         let snapshotter = Snapshotter::new(&snapshot_dir).unwrap();
-        
+
         // Create test data with real timestamps
         let ts1 = get_current_timestamp();
         thread::sleep(std::time::Duration::from_nanos(1));
         let ts2 = get_current_timestamp();
-        
+
         let tags1 = create_tags(&[("host", "server1")]);
         let tags2 = create_tags(&[("host", "server2")]);
-        
+
         let points1 = vec![
-            DataPoint { timestamp: ts1, value: 1.0, tags: tags1.clone() },
-            DataPoint { timestamp: ts2, value: 2.0, tags: tags2.clone() },
+            DataPoint {
+                timestamp: ts1,
+                value: 1.0,
+                tags: tags1.clone(),
+            },
+            DataPoint {
+                timestamp: ts2,
+                value: 2.0,
+                tags: tags2.clone(),
+            },
         ];
-        
+
         // Create a TimeSeriesChunk with our test data
         let chunk = create_test_chunk(points1);
-        
+
         // Create a HashMap to simulate storage
         let mut data = HashMap::new();
         data.insert("test_series".to_string(), Arc::new(RwLock::new(chunk)));
-        
+
         // Create a snapshot
         let snapshot_ts = get_current_timestamp();
         let snapshot_path = snapshotter.create_snapshot(&data, snapshot_ts).unwrap();
-        
+
         // Verify snapshot file was created
         assert!(snapshot_path.exists());
-        
+
         // Load the snapshot
         let loaded_data = snapshotter.load_latest_snapshot().unwrap().unwrap();
-        
+
         // Verify loaded data
         assert_eq!(loaded_data.len(), 1);
         assert!(loaded_data.contains_key("test_series"));
-        
+
         let loaded_points = &loaded_data["test_series"];
         assert_eq!(loaded_points.len(), 2);
-        
+
         // Verify point details
         assert_eq!(loaded_points[0].timestamp, ts1);
         assert_eq!(loaded_points[0].value, 1.0);
         assert_eq!(loaded_points[0].tags, tags1);
-        
+
         assert_eq!(loaded_points[1].timestamp, ts2);
         assert_eq!(loaded_points[1].value, 2.0);
         assert_eq!(loaded_points[1].tags, tags2);
-        
+
         // Verify timestamp extraction
-        let extracted_ts = snapshotter.get_latest_snapshot_timestamp().unwrap().unwrap();
+        let extracted_ts = snapshotter
+            .get_latest_snapshot_timestamp()
+            .unwrap()
+            .unwrap();
         assert_eq!(extracted_ts, snapshot_ts);
     }
-    
+
     #[test]
     fn test_snapshotter_no_snapshots() {
         // Create a temporary directory for snapshots
         let temp_dir = tempdir().unwrap();
         let snapshot_dir = temp_dir.path().join("empty_snapshots");
-        
+
         // Create directory
         fs::create_dir_all(&snapshot_dir).unwrap();
-        
+
         // Create a Snapshotter
         let snapshotter = Snapshotter::new(&snapshot_dir).unwrap();
-        
+
         // Try to load from empty directory
         let loaded = snapshotter.load_latest_snapshot().unwrap();
         assert!(loaded.is_none());
-        
+
         // Try to get latest timestamp
         let ts = snapshotter.get_latest_snapshot_timestamp().unwrap();
         assert!(ts.is_none());
     }
-    
+
     #[test]
     fn test_snapshotter_multiple_snapshots() {
         // Create a temporary directory for snapshots
         let temp_dir = tempdir().unwrap();
         let snapshot_dir = temp_dir.path().join("multi_snapshots");
-        
+
         // Create a Snapshotter
         let snapshotter = Snapshotter::new(&snapshot_dir).unwrap();
-        
+
         // Create simple test data
         let ts = get_current_timestamp();
-        let point = DataPoint { 
-            timestamp: ts, 
-            value: 1.0, 
-            tags: create_tags(&[("test", "tag")]) 
+        let point = DataPoint {
+            timestamp: ts,
+            value: 1.0,
+            tags: create_tags(&[("test", "tag")]),
         };
-        
+
         let chunk = create_test_chunk(vec![point]);
-        
+
         // Create storage with one series
         let mut data = HashMap::new();
         data.insert("series".to_string(), Arc::new(RwLock::new(chunk)));
-        
+
         // Create first snapshot
         let snapshot_ts1 = get_current_timestamp();
         snapshotter.create_snapshot(&data, snapshot_ts1).unwrap();
-        
+
         // Wait to ensure different timestamp
         thread::sleep(std::time::Duration::from_millis(10));
-        
+
         // Create second snapshot
         let snapshot_ts2 = get_current_timestamp();
         snapshotter.create_snapshot(&data, snapshot_ts2).unwrap();
-        
+
         // Verify latest timestamp is the second one
-        let latest_ts = snapshotter.get_latest_snapshot_timestamp().unwrap().unwrap();
+        let latest_ts = snapshotter
+            .get_latest_snapshot_timestamp()
+            .unwrap()
+            .unwrap();
         assert_eq!(latest_ts, snapshot_ts2);
-        
+
         // Verify we load the latest snapshot
         let loaded = snapshotter.load_latest_snapshot().unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
     }
-} 
+}

@@ -203,7 +203,8 @@ fn test_segments_enable_fast_restart_without_full_wal_replay() {
         let tags: TagSet = TagSet::new();
 
         for i in 0..500u64 {
-            db.insert(series, i, (i as f64) * 1.25, tags.clone()).unwrap();
+            db.insert(series, i, (i as f64) * 1.25, tags.clone())
+                .unwrap();
             if i % 50 == 0 {
                 db.flush().unwrap();
             }
@@ -222,7 +223,11 @@ fn test_segments_enable_fast_restart_without_full_wal_replay() {
     // WAL should be reset to just the header after recover.
     let wal_path = cfg.data_dir.join("wal").join("wal.log");
     let len = std::fs::metadata(&wal_path).unwrap().len();
-    assert!(len <= 12, "expected WAL to be truncated to header, got {} bytes", len);
+    assert!(
+        len <= 12,
+        "expected WAL to be truncated to header, got {} bytes",
+        len
+    );
 }
 
 #[test]
@@ -355,4 +360,3 @@ fn test_compaction_triggers_on_age_threshold() {
         m.segments.iter().any(|s| s.level == 1)
     });
 }
-

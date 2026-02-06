@@ -39,9 +39,13 @@ pub fn generate_insert_ops(
             tags.insert(key, value);
         }
 
-        ops.push(InsertOp { series, ts, val, tags });
+        ops.push(InsertOp {
+            series,
+            ts,
+            val,
+            tags,
+        });
     }
 
     ops
 }
-

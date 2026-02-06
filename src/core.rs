@@ -6,24 +6,30 @@ use crate::persistence::{Snapshotter, WriteAheadLog};
 use crate::query::execute_query;
 use crate::segments::{SegmentStore, SegmentStoreConfig};
 use crate::storage::InMemoryStorage;
-use crate::telemetry::{noop_event_listener, DbEvent, DbEventListener};
 use crate::telemetry::db_metrics;
+use crate::telemetry::{noop_event_listener, DbEvent, DbEventListener};
 use crate::types::{DataPoint, Row, TagSet, Timestamp, Value};
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Commands sent to the background flush thread to control flushing, shutdown, and snapshotting.
 enum FlushCommand {
-    Flush { ack: Option<mpsc::Sender<Result<(), DbError>>> },
-    Compact { ack: mpsc::Sender<Result<(), DbError>> },
+    Flush {
+        ack: Option<mpsc::Sender<Result<(), DbError>>>,
+    },
+    Compact {
+        ack: mpsc::Sender<Result<(), DbError>>,
+    },
     Shutdown,
-    Snapshot { ack: Option<mpsc::Sender<Result<PathBuf, DbError>>> },
+    Snapshot {
+        ack: Option<mpsc::Sender<Result<PathBuf, DbError>>>,
+    },
 }
 
 /// Configuration options for the DbCore
@@ -116,12 +122,18 @@ impl DbCore {
         // Initialize segment store early so we can seed sequence numbers.
         let segment_store = if config.enable_segments {
             let engine_dir = config.data_dir.join("engine");
-            Some(Arc::new(SegmentStore::open(engine_dir, config.segment_store.clone())?))
+            Some(Arc::new(SegmentStore::open(
+                engine_dir,
+                config.segment_store.clone(),
+            )?))
         } else {
             None
         };
 
-        let max_persisted_seq = segment_store.as_ref().map(|s| s.max_persisted_seq()).unwrap_or(0);
+        let max_persisted_seq = segment_store
+            .as_ref()
+            .map(|s| s.max_persisted_seq())
+            .unwrap_or(0);
         let next_seq = Arc::new(AtomicU64::new(max_persisted_seq.saturating_add(1)));
 
         // Initialize persistence components if enabled
@@ -168,10 +180,18 @@ impl DbCore {
             let mut do_flush = |ack: Option<mpsc::Sender<Result<(), DbError>>>| -> bool {
                 let flush_started = Instant::now();
                 // Advance retention tombstone watermark if configured.
-                if let (Some(store), Some(ttl)) = (&segment_store_clone, config_clone.retention_ttl) {
+                if let (Some(store), Some(ttl)) = (&segment_store_clone, config_clone.retention_ttl)
+                {
                     let now = SystemTime::now();
-                    if now.duration_since(last_retention_check_time).unwrap_or_default() >= config_clone.retention_check_interval {
-                        let now_ns = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+                    if now
+                        .duration_since(last_retention_check_time)
+                        .unwrap_or_default()
+                        >= config_clone.retention_check_interval
+                    {
+                        let now_ns = now
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
                         let ttl_ns = ttl.as_nanos() as u64;
                         let delete_before = now_ns.saturating_sub(ttl_ns);
                         match store.advance_delete_before(delete_before) {
@@ -186,33 +206,39 @@ impl DbCore {
                 }
 
                 // WAL rotation (optional) to keep replay bounded when segments exist.
-                let mut rotated_wal = if let (Some(wal), Some(_store)) = (&wal_clone, &segment_store_clone) {
-                    let now_ns = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    match wal.lock() {
-                        Ok(mut wal_guard) => match wal_guard.rotate(now_ns) {
-                            Ok(p) => Some(p),
+                let mut rotated_wal =
+                    if let (Some(wal), Some(_store)) = (&wal_clone, &segment_store_clone) {
+                        let now_ns = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        match wal.lock() {
+                            Ok(mut wal_guard) => match wal_guard.rotate(now_ns) {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    events.on_event(DbEvent::WalRotateFailed {
+                                        error: e.to_string(),
+                                    });
+                                    None
+                                }
+                            },
                             Err(e) => {
-                                events.on_event(DbEvent::WalRotateFailed { error: e.to_string() });
+                                events.on_event(DbEvent::WalRotateFailed {
+                                    error: e.to_string(),
+                                });
                                 None
                             }
-                        },
-                        Err(e) => {
-                            events.on_event(DbEvent::WalRotateFailed { error: e.to_string() });
-                            None
                         }
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
                 // Acquire lock on the buffer
                 let mut buffer_guard = match buffer_clone.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => {
-                        let e = DbError::LockError(format!("Write buffer lock poisoned: {}", poisoned));
+                        let e =
+                            DbError::LockError(format!("Write buffer lock poisoned: {}", poisoned));
                         if let Some(ack) = ack {
                             let _ = ack.send(Err(e));
                         }
@@ -232,10 +258,8 @@ impl DbCore {
                 };
                 drop(buffer_guard);
 
-                let points_to_flush: u64 = rows_to_flush
-                    .values()
-                    .map(|rows| rows.len() as u64)
-                    .sum();
+                let points_to_flush: u64 =
+                    rows_to_flush.values().map(|rows| rows.len() as u64).sum();
 
                 let mut flush_result: Result<(), DbError> = Ok(());
 
@@ -250,7 +274,9 @@ impl DbCore {
                                 }
                             }
                             Err(e) => {
-                                events.on_event(DbEvent::SegmentIngestFailed { error: e.to_string() });
+                                events.on_event(DbEvent::SegmentIngestFailed {
+                                    error: e.to_string(),
+                                });
                                 flush_result = Err(e);
                             }
                         }
@@ -298,13 +324,15 @@ impl DbCore {
                 // Check if it's time for a snapshot
                 if config_clone.enable_snapshots {
                     let now = SystemTime::now();
-                    if now.duration_since(last_snapshot_time).unwrap_or_default() >= config_clone.snapshot_interval {
+                    if now.duration_since(last_snapshot_time).unwrap_or_default()
+                        >= config_clone.snapshot_interval
+                    {
                         // It's time for a snapshot, but we'll do it in the next iteration to avoid blocking here
                         let _ = flush_cmd_tx_clone.send(FlushCommand::Snapshot { ack: None });
                         last_snapshot_time = now;
                     }
                 }
-                
+
                 // Wait for a command or timeout
                 match flush_cmd_rx.recv_timeout(config_clone.flush_interval) {
                     // Received a command to flush or timed out
@@ -323,7 +351,9 @@ impl DbCore {
                             match store.compact_blocking() {
                                 Ok(_) => Ok(()),
                                 Err(e) => {
-                                    events.on_event(DbEvent::SegmentCompactionFailed { error: e.to_string() });
+                                    events.on_event(DbEvent::SegmentCompactionFailed {
+                                        error: e.to_string(),
+                                    });
                                     Err(e)
                                 }
                             }
@@ -341,14 +371,15 @@ impl DbCore {
                                 Ok(guard) => guard,
                                 Err(_) => continue, // Skip if poisoned
                             };
-                            
+
                             let data_to_flush = match buffer_guard.drain_all_buffers() {
                                 Ok(rows) => rows,
                                 Err(_) => HashMap::new(),
                             };
                             drop(buffer_guard);
-                            
-                            let points_to_flush: u64 = data_to_flush.values().map(|rows| rows.len() as u64).sum();
+
+                            let points_to_flush: u64 =
+                                data_to_flush.values().map(|rows| rows.len() as u64).sum();
 
                             if !data_to_flush.is_empty() {
                                 if let Some(store) = &segment_store_clone {
@@ -375,23 +406,29 @@ impl DbCore {
 
                             // Metrics: snapshot-triggered flush duration + points.
                             db_metrics::record_flush(flush_started.elapsed(), points_to_flush);
-                            
+
                             // Now create the snapshot
                             if let Ok(storage_guard) = storage_clone.read() {
                                 let now = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_nanos() as u64;
-                                
-                                let res = snapshotter.create_snapshot(storage_guard.get_all_series(), now);
+
+                                let res = snapshotter
+                                    .create_snapshot(storage_guard.get_all_series(), now);
                                 match &res {
-                                    Ok(path) => events.on_event(DbEvent::SnapshotCreated { path: path.clone(), timestamp: now }),
-                                    Err(e) => events.on_event(DbEvent::SnapshotFailed { error: e.to_string() }),
+                                    Ok(path) => events.on_event(DbEvent::SnapshotCreated {
+                                        path: path.clone(),
+                                        timestamp: now,
+                                    }),
+                                    Err(e) => events.on_event(DbEvent::SnapshotFailed {
+                                        error: e.to_string(),
+                                    }),
                                 }
                                 if let Some(ack) = ack {
                                     let _ = ack.send(res);
                                 }
-                                
+
                                 // Log the snapshot in WAL if enabled
                                 if let Some(wal) = &wal_clone {
                                     if let Ok(mut wal_guard) = wal.lock() {
@@ -415,7 +452,7 @@ impl DbCore {
                             Err(_) => HashMap::new(),
                         };
                         drop(buffer_guard);
-                        
+
                         if !rows_to_flush.is_empty() {
                             if let Some(store) = &segment_store_clone {
                                 let _ = store.ingest_l0(rows_to_flush.clone());
@@ -438,7 +475,7 @@ impl DbCore {
                                 let _ = storage_guard.append_batch(data_points_to_flush);
                             }
                         }
-                        
+
                         // Flush and close WAL if enabled
                         if let Some(wal) = &wal_clone {
                             if let Ok(mut wal_guard) = wal.lock() {
@@ -446,19 +483,19 @@ impl DbCore {
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_nanos() as u64;
-                                
+
                                 // Log the final flush
                                 if let Err(e) = wal_guard.log_flush(now) {
                                     let _ = e;
                                 }
-                                
+
                                 // Close the WAL
                                 if let Err(e) = wal_guard.close() {
                                     let _ = e;
                                 }
                             }
                         }
-                        
+
                         events.on_event(DbEvent::FlushThreadStopping);
                         break; // Exit the loop
                     }
@@ -499,7 +536,7 @@ impl DbCore {
         config.flush_interval = flush_interval;
         Self::with_config(config).expect("Failed to initialize DbCore with default configuration")
     }
-    
+
     /// Recovers the database state from disk using the latest snapshot and any newer WAL entries.
     ///
     /// This method should be called after constructing the database if you want to restore
@@ -522,17 +559,29 @@ impl DbCore {
 
             if let Some(wal) = &self.wal {
                 let entries = wal.lock()?.read_all_entries_all_logs()?;
-                let mut rows_by_series: std::collections::HashMap<String, Vec<Row>> = std::collections::HashMap::new();
+                let mut rows_by_series: std::collections::HashMap<String, Vec<Row>> =
+                    std::collections::HashMap::new();
 
                 for entry in entries {
                     match entry {
-                        crate::persistence::WalEntry::Insert { seq, series, timestamp, value, tags } => {
+                        crate::persistence::WalEntry::Insert {
+                            seq,
+                            series,
+                            timestamp,
+                            value,
+                            tags,
+                        } => {
                             if seq > base_seq {
                                 max_seq_seen = max_seq_seen.max(seq);
                                 rows_by_series
                                     .entry(series)
                                     .or_insert_with(Vec::new)
-                                    .push(Row { seq, timestamp, value, tags });
+                                    .push(Row {
+                                        seq,
+                                        timestamp,
+                                        value,
+                                        tags,
+                                    });
                             }
                         }
                         crate::persistence::WalEntry::Flush { .. } => {}
@@ -569,7 +618,7 @@ impl DbCore {
             // No persistence enabled, nothing to recover
             return Ok(());
         }
-        
+
         // First try to load from the latest snapshot
         let mut latest_timestamp = 0;
         if let Some(snapshotter) = &self.snapshotter {
@@ -578,39 +627,49 @@ impl DbCore {
                 if let Ok(Some(ts)) = snapshotter.get_latest_snapshot_timestamp() {
                     latest_timestamp = ts;
                 }
-                
+
                 // Load snapshot data into storage
                 let mut storage_guard = self.storage.write()?;
                 for (series, points) in data {
                     storage_guard.append_points(&series, points)?;
                 }
-                
+
                 let _ = latest_timestamp;
             }
         }
-        
+
         // Apply any WAL entries that are newer than the snapshot
         if let Some(wal) = &self.wal {
             let wal_entries = wal.lock()?.read_all_entries()?;
-            
+
             let mut pending_inserts = std::collections::HashMap::new();
-            
+
             for entry in wal_entries {
                 match entry {
-                    crate::persistence::WalEntry::Insert { seq: _seq, series, timestamp, value, tags } => {
+                    crate::persistence::WalEntry::Insert {
+                        seq: _seq,
+                        series,
+                        timestamp,
+                        value,
+                        tags,
+                    } => {
                         // Only apply if newer than snapshot
                         if timestamp > latest_timestamp {
-                            let point = DataPoint { timestamp, value, tags };
+                            let point = DataPoint {
+                                timestamp,
+                                value,
+                                tags,
+                            };
                             pending_inserts
                                 .entry(series)
                                 .or_insert_with(Vec::new)
                                 .push(point);
                         }
-                    },
+                    }
                     crate::persistence::WalEntry::Flush { timestamp } => {
                         // This was a flush or snapshot point
                         latest_timestamp = timestamp;
-                        
+
                         // Apply all pending inserts
                         if !pending_inserts.is_empty() {
                             let mut storage_guard = self.storage.write()?;
@@ -621,7 +680,7 @@ impl DbCore {
                     }
                 }
             }
-            
+
             // Apply any remaining pending inserts
             if !pending_inserts.is_empty() {
                 let mut storage_guard = self.storage.write()?;
@@ -629,10 +688,10 @@ impl DbCore {
                     storage_guard.append_points(&series, points)?;
                 }
             }
-            
+
             let _ = latest_timestamp;
         }
-        
+
         Ok(())
     }
 
@@ -663,17 +722,22 @@ impl DbCore {
         tags: TagSet,
     ) -> Result<(), DbError> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let row = Row { seq, timestamp, value, tags: tags.clone() };
-        
+        let row = Row {
+            seq,
+            timestamp,
+            value,
+            tags: tags.clone(),
+        };
+
         // Log to WAL if enabled
         if let Some(wal) = &self.wal {
             let mut wal_guard = wal.lock()?;
             wal_guard.log_insert(seq, series, timestamp, value, tags)?;
         }
-        
+
         // Acquire lock on the write buffer
         let mut buffer_guard = self.write_buffer.lock()?; // Propagate PoisonError
-        // Stage the data point
+                                                          // Stage the data point
         let res = buffer_guard.stage(series, row);
         if res.is_ok() {
             db_metrics::record_ingest_points(1);
@@ -740,10 +804,12 @@ impl DbCore {
         let (tx, rx) = mpsc::channel();
         self.flush_cmd_tx
             .send(FlushCommand::Flush { ack: Some(tx) })
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to send flush command: {}", e)))?;
-        let res = rx.recv()
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to receive flush ack: {}", e)))?
-            ;
+            .map_err(|e| {
+                DbError::BackgroundTaskError(format!("Failed to send flush command: {}", e))
+            })?;
+        let res = rx.recv().map_err(|e| {
+            DbError::BackgroundTaskError(format!("Failed to receive flush ack: {}", e))
+        })?;
         if res.is_ok() {
             db_metrics::record_flush_end_to_end(started.elapsed());
         }
@@ -755,9 +821,12 @@ impl DbCore {
         let (tx, rx) = mpsc::channel();
         self.flush_cmd_tx
             .send(FlushCommand::Compact { ack: tx })
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to send compaction command: {}", e)))?;
-        rx.recv()
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to receive compaction ack: {}", e)))?
+            .map_err(|e| {
+                DbError::BackgroundTaskError(format!("Failed to send compaction command: {}", e))
+            })?;
+        rx.recv().map_err(|e| {
+            DbError::BackgroundTaskError(format!("Failed to receive compaction ack: {}", e))
+        })?
     }
 
     /// Sets the retention tombstone watermark (delete-before timestamp, nanoseconds since epoch).
@@ -768,9 +837,11 @@ impl DbCore {
         if let Some(store) = &self.segment_store {
             return store.advance_delete_before(delete_before);
         }
-        Err(DbError::ConfigError("Segments are not enabled (retention requires segments)".to_string()))
+        Err(DbError::ConfigError(
+            "Segments are not enabled (retention requires segments)".to_string(),
+        ))
     }
-    
+
     /// Triggers an immediate snapshot of the current database state.
     ///
     /// This sends a command to the background flush thread to create a snapshot of all
@@ -784,19 +855,23 @@ impl DbCore {
     /// Returns an error if snapshots are disabled or if the background thread cannot be reached.
     pub fn snapshot(&self) -> Result<(), DbError> {
         if self.snapshotter.is_none() {
-            return Err(DbError::ConfigError("Snapshots are not enabled".to_string()));
+            return Err(DbError::ConfigError(
+                "Snapshots are not enabled".to_string(),
+            ));
         }
 
         let (tx, rx) = mpsc::channel();
         self.flush_cmd_tx
             .send(FlushCommand::Snapshot { ack: Some(tx) })
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to send snapshot command: {}", e)))?;
-        let _ = rx
-            .recv()
-            .map_err(|e| DbError::BackgroundTaskError(format!("Failed to receive snapshot ack: {}", e)))??;
+            .map_err(|e| {
+                DbError::BackgroundTaskError(format!("Failed to send snapshot command: {}", e))
+            })?;
+        let _ = rx.recv().map_err(|e| {
+            DbError::BackgroundTaskError(format!("Failed to receive snapshot ack: {}", e))
+        })??;
         Ok(())
     }
-    
+
     /// Returns a reference to the current database configuration.
     ///
     /// This allows inspection of the configuration used to initialize the database.
@@ -811,7 +886,8 @@ impl DbCore {
 /// Default implementation uses a 1-second flush interval.
 impl Default for DbCore {
     fn default() -> Self {
-        Self::with_config(DbConfig::default()).expect("Failed to initialize DbCore with default configuration")
+        Self::with_config(DbConfig::default())
+            .expect("Failed to initialize DbCore with default configuration")
     }
 }
 
@@ -824,10 +900,11 @@ impl Drop for DbCore {
         // Wait for the flush thread to finish
         if let Some(handle) = self.flush_handle.take() {
             if let Err(e) = handle.join() {
-                self.config.event_listener.on_event(DbEvent::FlushThreadPanicked);
+                self.config
+                    .event_listener
+                    .on_event(DbEvent::FlushThreadPanicked);
                 let _ = e;
             }
         }
     }
 }
-

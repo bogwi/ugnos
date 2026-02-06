@@ -16,8 +16,10 @@ fn test_recovery_after_crash_wal_append() {
     {
         let wal_dir = data_dir.join("wal");
         let mut wal = WriteAheadLog::new(&wal_dir, 1).unwrap();
-        wal.log_insert(1, "series_a", 10, 1.25, TagSet::new()).unwrap();
-        wal.log_insert(2, "series_a", 11, 2.25, TagSet::new()).unwrap();
+        wal.log_insert(1, "series_a", 10, 1.25, TagSet::new())
+            .unwrap();
+        wal.log_insert(2, "series_a", 11, 2.25, TagSet::new())
+            .unwrap();
         wal.flush_to_disk().unwrap();
         // Intentionally do not call `close()` to mimic abrupt termination.
     }
@@ -49,8 +51,10 @@ fn test_recovery_after_crash_during_flush_wal_rotated_segments_enabled() {
     {
         let wal_dir = data_dir.join("wal");
         let mut wal = WriteAheadLog::new(&wal_dir, 1).unwrap();
-        wal.log_insert(1, "series_b", 100, 10.0, TagSet::new()).unwrap();
-        wal.log_insert(2, "series_b", 101, 11.0, TagSet::new()).unwrap();
+        wal.log_insert(1, "series_b", 100, 10.0, TagSet::new())
+            .unwrap();
+        wal.log_insert(2, "series_b", 101, 11.0, TagSet::new())
+            .unwrap();
         wal.flush_to_disk().unwrap();
         wal.rotate(123_456_789).unwrap();
     }
@@ -74,7 +78,11 @@ fn test_recovery_after_crash_during_flush_wal_rotated_segments_enabled() {
     // WAL should be truncated to header after recovery (bounded restart cost).
     let wal_path = cfg.data_dir.join("wal").join("wal.log");
     let len = fs::metadata(&wal_path).unwrap().len();
-    assert!(len <= 12, "expected WAL to be truncated to header, got {} bytes", len);
+    assert!(
+        len <= 12,
+        "expected WAL to be truncated to header, got {} bytes",
+        len
+    );
 }
 
 #[test]
@@ -150,11 +158,14 @@ fn test_wal_corruption_is_detected_with_series_and_timestamp_context() {
     let wal = WriteAheadLog::new(&wal_dir, 1).unwrap();
     let err = wal.read_all_entries().unwrap_err();
     match err {
-        DbError::Corruption { series: s, timestamp: t, .. } => {
+        DbError::Corruption {
+            series: s,
+            timestamp: t,
+            ..
+        } => {
             assert_eq!(s.as_deref(), Some(series));
             assert_eq!(t, Some(ts));
         }
         other => panic!("expected DbError::Corruption, got {other:?}"),
     }
 }
-

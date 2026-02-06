@@ -5,10 +5,21 @@ use std::time::Duration;
 use crc32fast::Hasher as Crc32;
 use tempfile::tempdir;
 
+use ugnos::encoding::{
+    BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding, SER_BLOCK_MAGIC,
+};
 use ugnos::{DbConfig, DbCore, DbError, TagSet};
-use ugnos::segments::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
 
 const SEG_MAGIC: &[u8; 8] = b"UGNSEG01";
+
+// V2 series block header layout (encoding.rs): magic[0..8], version[8..12], row_count[12..16],
+// codec[16..20], compression_param[20..24], uncompressed_len[24..28], 
+// uncompressed_crc32[28..32], stored_len[32..36], payload[36..].
+// Acceptance criterion: storage format includes block-level checksums and versioning.
+const SERIES_BLOCK_V2_VERSION_OFFSET: usize = 8;
+const SERIES_BLOCK_V2_CRC_OFFSET: usize = 28;
+const SERIES_BLOCK_V2_HEADER_LEN: usize = 36;
+const SERIES_BLOCK_V2_VERSION: u32 = 2;
 const SEG_FOOTER_MAGIC: &[u8; 8] = b"UGNSEGF1";
 const FOOTER_LEN: usize = 8 + 8 + 8 + 4; // magic + index_off + index_len + crc32
 
@@ -94,7 +105,10 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
     let index_offset_usz: usize = index_offset.try_into().expect("index_offset usize");
     let index_len_usz: usize = index_len.try_into().expect("index_len usize");
     assert!(
-        index_offset_usz.checked_add(index_len_usz).unwrap_or(usize::MAX) <= seg_bytes.len(),
+        index_offset_usz
+            .checked_add(index_len_usz)
+            .unwrap_or(usize::MAX)
+            <= seg_bytes.len(),
         "index range out of bounds"
     );
     let index_bytes = &seg_bytes[index_offset_usz..index_offset_usz + index_len_usz];
@@ -115,6 +129,60 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
         out.insert(name, SeriesIndexEntry { offset, len });
     }
     out
+}
+
+/// Acceptance criterion: 
+/// "Storage format includes block-level checksums and versioning."
+/// This test would FAIL if the format were changed to
+/// remove the version field or the payload checksum field.
+#[test]
+fn test_ac_storage_format_includes_block_level_checksum_and_version() {
+    let dir = tempdir().unwrap();
+    let encoding = SegmentEncodingConfig {
+        float_encoding: FloatEncoding::Raw64,
+        tag_encoding: TagEncoding::Dictionary,
+        compression: BlockCompression::None,
+    };
+    let cfg = make_cfg(dir.path(), encoding);
+
+    {
+        let db = DbCore::with_config(cfg.clone()).unwrap();
+        db.insert("s", 1, 1.0, TagSet::new()).unwrap();
+        db.insert("s", 2, 2.0, TagSet::new()).unwrap();
+        db.flush().unwrap();
+    }
+
+    let seg_path = first_segment_path(&cfg);
+    let bytes = std::fs::read(&seg_path).unwrap();
+    let index = parse_segment_index(&bytes);
+    let ent = index.get("s").expect("series s in index");
+    let off: usize = ent.offset.try_into().expect("offset");
+    let len: usize = ent.len.try_into().expect("len");
+    assert!(off + len <= bytes.len(), "block range in bounds");
+    let block = &bytes[off..off + len];
+
+    assert!(
+        block.len() >= SERIES_BLOCK_V2_HEADER_LEN,
+        "block must have full v2 header including checksum and version; len={}",
+        block.len()
+    );
+    assert_eq!(
+        &block[0..8],
+        SER_BLOCK_MAGIC,
+        "storage format must include series block magic"
+    );
+    let version = read_u32_le(block, SERIES_BLOCK_V2_VERSION_OFFSET);
+    assert_eq!(
+        version, SERIES_BLOCK_V2_VERSION,
+        "storage format must include block version (v2) at offset {}",
+        SERIES_BLOCK_V2_VERSION_OFFSET
+    );
+    let payload_checksum = read_u32_le(block, SERIES_BLOCK_V2_CRC_OFFSET);
+    assert_ne!(
+        payload_checksum, 0,
+        "block-level payload checksum must be present (non-zero for non-empty payload) at offset {}",
+        SERIES_BLOCK_V2_CRC_OFFSET
+    );
 }
 
 #[test]
@@ -150,10 +218,18 @@ fn test_encoding_and_compression_roundtrip_with_weird_floats_and_tags() {
         1.25,
     ];
     let timestamps = [100u64, 80, 90, 90, 10_000_000_000, 91];
-    let tags = [tags0.clone(), tags0.clone(), tags1.clone(), tags0.clone(), tags1.clone(), tags0.clone()];
+    let tags = [
+        tags0.clone(),
+        tags0.clone(),
+        tags1.clone(),
+        tags0.clone(),
+        tags1.clone(),
+        tags0.clone(),
+    ];
 
     for i in 0..timestamps.len() {
-        db.insert(series, timestamps[i], values[i], tags[i].clone()).unwrap();
+        db.insert(series, timestamps[i], values[i], tags[i].clone())
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -164,10 +240,14 @@ fn test_encoding_and_compression_roundtrip_with_weird_floats_and_tags() {
 
     // Spot-check that at least one NaN payload survived bit-exactly.
     let want_nan_bits = values[0].to_bits();
-    let got_nan_bits = got.iter().find_map(|(_, v)| {
-        if v.is_nan() { Some(v.to_bits()) } else { None }
-    }).expect("expected at least one NaN to survive");
-    assert_eq!(got_nan_bits, want_nan_bits, "NaN payload must roundtrip exactly");
+    let got_nan_bits = got
+        .iter()
+        .find_map(|(_, v)| if v.is_nan() { Some(v.to_bits()) } else { None })
+        .expect("expected at least one NaN to survive");
+    assert_eq!(
+        got_nan_bits, want_nan_bits,
+        "NaN payload must roundtrip exactly"
+    );
 
     // Tag-filtered query
     let mut filter: TagSet = TagSet::new();
@@ -191,7 +271,8 @@ fn test_block_checksums_detect_corruption() {
     let series = "corrupt_me";
     let tags: TagSet = TagSet::new();
     for ts in 0u64..200u64 {
-        db.insert(series, ts, (ts as f64) * 0.125, tags.clone()).unwrap();
+        db.insert(series, ts, (ts as f64) * 0.125, tags.clone())
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -331,3 +412,166 @@ fn test_space_reduction_with_compression_is_measurable() {
     );
 }
 
+/// Acceptance criterion: 
+/// "measurable space reduction without breaking p99 latency targets." 
+/// This test asserts p99 query latency stays within a target when using encoded/compressed segments.
+const P99_QUERY_LATENCY_TARGET_MS: u64 = 200;
+
+#[test]
+fn test_ac_query_latency_with_encoded_segments_within_target() {
+    let dir = tempdir().unwrap();
+    let encoding = SegmentEncodingConfig {
+        float_encoding: FloatEncoding::GorillaXor,
+        tag_encoding: TagEncoding::Dictionary,
+        compression: BlockCompression::Zstd { level: 1 },
+    };
+    let cfg = make_cfg(dir.path(), encoding);
+    let db = DbCore::with_config(cfg).unwrap();
+
+    let series = "latency_test";
+    let tags: TagSet = TagSet::new();
+    for ts in 0u64..5_000u64 {
+        db.insert(series, ts, (ts as f64) * 0.001, tags.clone())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let range = 0u64..u64::MAX;
+    let mut latencies_ms: Vec<u64> = Vec::with_capacity(500);
+    for _ in 0..500 {
+        let start = std::time::Instant::now();
+        let _ = db.query(series, range.clone(), None).unwrap();
+        latencies_ms.push(start.elapsed().as_millis() as u64);
+    }
+    latencies_ms.sort_unstable();
+    let p99_idx = (latencies_ms.len() * 99) / 100;
+    let p99_ms = latencies_ms[p99_idx.min(latencies_ms.len().saturating_sub(1))];
+
+    assert!(
+        p99_ms <= P99_QUERY_LATENCY_TARGET_MS,
+        "p99 query latency {} ms must not exceed target {} ms (encoding & compression must not break latency)",
+        p99_ms,
+        P99_QUERY_LATENCY_TARGET_MS
+    );
+}
+
+
+/// If delta encoding or decoder is wrong, 
+/// reordered timestamps could produce wrong or silent corruption.
+#[test]
+fn test_breakit_roundtrip_preserves_timestamp_order_and_values_bit_exact() {
+    let dir = tempdir().unwrap();
+    let encoding = SegmentEncodingConfig {
+        float_encoding: FloatEncoding::GorillaXor,
+        tag_encoding: TagEncoding::Dictionary,
+        compression: BlockCompression::Zstd { level: 3 },
+    };
+    let cfg = make_cfg(dir.path(), encoding);
+    let db = DbCore::with_config(cfg).unwrap();
+
+    let series = "order";
+    let mut tags: TagSet = TagSet::new();
+    tags.insert("k".to_string(), "v".to_string());
+
+    let timestamps: Vec<u64> = (0..500).map(|i| 1_000_000 + i * 100).collect();
+    let values: Vec<f64> = (0..500)
+        .map(|i| f64::from_bits((i as u64).wrapping_mul(0x0008_0000_0000_0001)))
+        .collect();
+    for i in 0..timestamps.len() {
+        db.insert(series, timestamps[i], values[i], tags.clone())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let got = db.query(series, 0..u64::MAX, None).unwrap();
+    assert_eq!(
+        got.len(),
+        timestamps.len(),
+        "row count must roundtrip exactly"
+    );
+    for (i, (ts, val)) in got.iter().enumerate() {
+        assert_eq!(
+            *ts, timestamps[i],
+            "timestamp at index {} must roundtrip",
+            i
+        );
+        assert_eq!(
+            val.to_bits(),
+            values[i].to_bits(),
+            "value at index {} must roundtrip bit-exact",
+            i
+        );
+    }
+}
+
+/// If checksum were skipped, 
+/// corrupting only the payload (and not the header) could return wrong data.
+/// We corrupt a byte in the block and expect a corruption error (segment block CRC or payload CRC).
+#[test]
+fn test_breakit_corrupt_any_byte_in_block_yields_corruption_error() {
+    let dir = tempdir().unwrap();
+    let encoding = SegmentEncodingConfig {
+        float_encoding: FloatEncoding::Raw64,
+        tag_encoding: TagEncoding::Dictionary,
+        compression: BlockCompression::None,
+    };
+    let cfg = make_cfg(dir.path(), encoding);
+    let db = DbCore::with_config(cfg.clone()).unwrap();
+
+    db.insert("x", 1, 1.0, TagSet::new()).unwrap();
+    db.insert("x", 2, 2.0, TagSet::new()).unwrap();
+    db.flush().unwrap();
+
+    let seg_path = first_segment_path(&cfg);
+    let mut bytes = std::fs::read(&seg_path).unwrap();
+    let index = parse_segment_index(&bytes);
+    let ent = *index.get("x").expect("series x");
+    let off: usize = ent.offset.try_into().unwrap();
+    let len: usize = ent.len.try_into().unwrap();
+    assert!(
+        len >= SERIES_BLOCK_V2_HEADER_LEN + 1,
+        "block has payload to corrupt"
+    );
+    let corrupt_at = off + SERIES_BLOCK_V2_HEADER_LEN;
+    bytes[corrupt_at] ^= 0xFF;
+    std::fs::write(&seg_path, bytes).unwrap();
+
+    let err = db.query("x", 0..u64::MAX, None).unwrap_err();
+    match err {
+        DbError::Corruption { .. } => {}
+        other => panic!("corrupt payload must yield Corruption, got {other:?}"),
+    }
+}
+
+/// Adversarial: 
+/// all NaN payloads; if Gorilla or decoder mishandles NaN, this would produce wrong or panic.
+#[test]
+fn test_breakit_all_nan_roundtrip() {
+    let dir = tempdir().unwrap();
+    let encoding = SegmentEncodingConfig {
+        float_encoding: FloatEncoding::GorillaXor,
+        tag_encoding: TagEncoding::Dictionary,
+        compression: BlockCompression::None,
+    };
+    let cfg = make_cfg(dir.path(), encoding);
+    let db = DbCore::with_config(cfg).unwrap();
+
+    let series = "nan";
+    let nan_bits = [0x7ff8_0000_0000_0001u64, 0xfff8_0000_0000_0002];
+    for (i, &bits) in nan_bits.iter().enumerate() {
+        db.insert(series, i as u64, f64::from_bits(bits), TagSet::new())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let got = db.query(series, 0..u64::MAX, None).unwrap();
+    assert_eq!(got.len(), nan_bits.len());
+    for (i, (_, v)) in got.iter().enumerate() {
+        assert!(v.is_nan(), "value {} must be NaN", i);
+        assert_eq!(
+            v.to_bits(),
+            nan_bits[i],
+            "NaN payload must roundtrip bit-exact"
+        );
+    }
+}

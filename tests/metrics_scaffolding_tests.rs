@@ -22,7 +22,9 @@ fn parse_sample(rendered: &str, metric: &str) -> Option<f64> {
         let key = parts.next()?;
         let val = parts.next()?;
         // Support exact match and label form: `name{...} value`.
-        if key == metric || key.starts_with(metric) && key.as_bytes().get(metric.len()).copied() == Some(b'{') {
+        if key == metric
+            || key.starts_with(metric) && key.as_bytes().get(metric.len()).copied() == Some(b'{')
+        {
             if let Ok(v) = val.parse::<f64>() {
                 return Some(v);
             }
@@ -54,9 +56,12 @@ fn emits_ingest_flush_wal_snapshot_metrics() {
     let before_ingest = parse_counter(&before, "ugnos_ingest_points");
     let before_flush_points = parse_counter(&before, "ugnos_flush_points");
     let before_wal_bytes = parse_counter(&before, "ugnos_wal_bytes_written");
-    let before_wal_fsync_count = parse_sample(&before, "ugnos_wal_fsync_duration_seconds_count").unwrap_or(0.0);
-    let before_flush_count = parse_sample(&before, "ugnos_flush_duration_seconds_count").unwrap_or(0.0);
-    let before_snapshot_count = parse_sample(&before, "ugnos_snapshot_duration_seconds_count").unwrap_or(0.0);
+    let before_wal_fsync_count =
+        parse_sample(&before, "ugnos_wal_fsync_duration_seconds_count").unwrap_or(0.0);
+    let before_flush_count =
+        parse_sample(&before, "ugnos_flush_duration_seconds_count").unwrap_or(0.0);
+    let before_snapshot_count =
+        parse_sample(&before, "ugnos_snapshot_duration_seconds_count").unwrap_or(0.0);
 
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = DbConfig::default();
@@ -89,9 +94,12 @@ fn emits_ingest_flush_wal_snapshot_metrics() {
     let after_ingest = parse_counter(&after, "ugnos_ingest_points");
     let after_flush_points = parse_counter(&after, "ugnos_flush_points");
     let after_wal_bytes = parse_counter(&after, "ugnos_wal_bytes_written");
-    let after_wal_fsync_count = parse_sample(&after, "ugnos_wal_fsync_duration_seconds_count").unwrap_or(0.0);
-    let after_flush_count = parse_sample(&after, "ugnos_flush_duration_seconds_count").unwrap_or(0.0);
-    let after_snapshot_count = parse_sample(&after, "ugnos_snapshot_duration_seconds_count").unwrap_or(0.0);
+    let after_wal_fsync_count =
+        parse_sample(&after, "ugnos_wal_fsync_duration_seconds_count").unwrap_or(0.0);
+    let after_flush_count =
+        parse_sample(&after, "ugnos_flush_duration_seconds_count").unwrap_or(0.0);
+    let after_snapshot_count =
+        parse_sample(&after, "ugnos_snapshot_duration_seconds_count").unwrap_or(0.0);
     let snapshot_size = parse_sample(&after, "ugnos_snapshot_size_bytes").unwrap_or(0.0);
 
     assert!(
@@ -140,6 +148,8 @@ fn emits_ingest_flush_wal_snapshot_metrics() {
         after_snapshot_count
     );
 
-    assert!(snapshot_size > 0.0, "expected snapshot size gauge to be > 0");
+    assert!(
+        snapshot_size > 0.0,
+        "expected snapshot size gauge to be > 0"
+    );
 }
-

@@ -74,4 +74,3 @@ impl TimeSeriesChunk {
         self.timestamps.is_empty()
     }
 }
-

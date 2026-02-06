@@ -20,7 +20,12 @@ struct InsertOp {
     tags: TagSet,
 }
 
-fn generate_ops(points: usize, series_count: usize, tag_pairs: usize, tag_cardinality: u32) -> Vec<InsertOp> {
+fn generate_ops(
+    points: usize,
+    series_count: usize,
+    tag_pairs: usize,
+    tag_cardinality: u32,
+) -> Vec<InsertOp> {
     let mut rng = ChaCha8Rng::seed_from_u64(SEED);
     let mut ops = Vec::with_capacity(points);
     for i in 0..points {
@@ -34,7 +39,12 @@ fn generate_ops(points: usize, series_count: usize, tag_pairs: usize, tag_cardin
             let value = format!("v{}", v);
             tags.insert(key, value);
         }
-        ops.push(InsertOp { series, ts, val, tags });
+        ops.push(InsertOp {
+            series,
+            ts,
+            val,
+            tags,
+        });
     }
     ops
 }
@@ -115,4 +125,3 @@ fn microbench_flush_latency_guard() {
         max_flush_ms
     );
 }
-
