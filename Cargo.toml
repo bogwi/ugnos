@@ -25,6 +25,8 @@ tempfile = "3.19.1"
 crc32fast = "1.4"
 metrics = "0.24.3"
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false, optional = true }
+lz4_flex = "0.12.0"
+zstd = "0.13.3"
 # Add other dependencies as needed, e.g.:
 # log = "0.4"
 # chrono = "0.4"

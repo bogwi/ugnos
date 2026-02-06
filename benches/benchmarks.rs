@@ -3,6 +3,7 @@ mod datasets;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use tempfile::TempDir;
 use ugnos::{DbConfig, DbCore, TagSet};
+use ugnos::segments::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
 
 use std::time::Duration;
 
@@ -14,6 +15,17 @@ fn make_config(data_dir: &std::path::Path, enable_wal: bool) -> DbConfig {
     cfg.wal_buffer_size = 1024;
     cfg.enable_snapshots = false;
     cfg.flush_interval = Duration::from_secs(60 * 60);
+    cfg
+}
+
+fn make_segments_config(data_dir: &std::path::Path, encoding: SegmentEncodingConfig) -> DbConfig {
+    let mut cfg = DbConfig::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    cfg.enable_segments = true;
+    cfg.enable_wal = false;
+    cfg.enable_snapshots = false;
+    cfg.flush_interval = Duration::from_secs(60 * 60);
+    cfg.segment_store.encoding = encoding;
     cfg
 }
 
@@ -97,6 +109,71 @@ fn bench_query_fixed_dataset(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ingest_fixed_dataset, bench_query_fixed_dataset);
+fn bench_query_segments_encoded_blocks(c: &mut Criterion) {
+    let ops = datasets::generate_insert_ops(datasets::DEFAULT_SEED, 120_000, 64, 4, 16);
+
+    let variants: [(&str, SegmentEncodingConfig); 2] = [
+        (
+            "uncompressed_raw64",
+            SegmentEncodingConfig {
+                float_encoding: FloatEncoding::Raw64,
+                tag_encoding: TagEncoding::Dictionary,
+                compression: BlockCompression::None,
+            },
+        ),
+        (
+            "zstd1_gorilla",
+            SegmentEncodingConfig {
+                float_encoding: FloatEncoding::GorillaXor,
+                tag_encoding: TagEncoding::Dictionary,
+                compression: BlockCompression::Zstd { level: 1 },
+            },
+        ),
+    ];
+
+    // Query a stable slice of one series.
+    let series = "series_7";
+    let range = 40_000u64..90_000u64;
+
+    // Deterministic filter: "k0=v0" matches ~1/16 of points.
+    let mut filter: TagSet = TagSet::new();
+    filter.insert("k0".to_string(), "v0".to_string());
+
+    let mut group = c.benchmark_group("segments_query");
+
+    for (name, enc) in variants {
+        let dir = TempDir::new().expect("tempdir");
+        let db = DbCore::with_config(make_segments_config(dir.path(), enc)).expect("db init");
+        for op in &ops {
+            db.insert(&op.series, op.ts, op.val, op.tags.clone()).unwrap();
+        }
+        db.flush().unwrap();
+
+        group.bench_function(format!("{name}_range_no_tags"), |b| {
+            b.iter(|| {
+                let _ = db.query(black_box(series), black_box(range.clone()), black_box(None)).unwrap();
+            })
+        });
+        group.bench_function(format!("{name}_range_with_tag_filter"), |b| {
+            b.iter(|| {
+                let _ = db
+                    .query(black_box(series), black_box(range.clone()), black_box(Some(&filter)))
+                    .unwrap();
+            })
+        });
+
+        drop(db);
+        drop(dir);
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_ingest_fixed_dataset,
+    bench_query_fixed_dataset,
+    bench_query_segments_encoded_blocks
+);
 criterion_main!(benches);
 
