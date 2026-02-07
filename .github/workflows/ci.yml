@@ -29,6 +29,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Restore iai-callgrind baseline (for comparison / N/A avoidance)
+        id: restore-iai
+        uses: actions/cache/restore@v4
+        with:
+          path: target/iai
+          key: iai-baseline-v1
       - name: Run microbench regression gates (release)
         run: cargo test --release --test microbench_regressions -- --ignored
       - name: Install Valgrind (for iai-callgrind microbench suite)
@@ -36,5 +42,19 @@ jobs:
       - name: Install iai-callgrind-runner (for iai-callgrind microbench suite)
         run: cargo install --locked --version 0.16.1 iai-callgrind-runner
       - name: Run deterministic microbench suite (iai-callgrind)
-        run: cargo bench --bench microbench_iai
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            cargo bench --bench microbench_iai -- --save-baseline=default
+          elif [ "${{ steps.restore-iai.outputs.cache-hit }}" = "true" ]; then
+            cargo bench --bench microbench_iai -- --baseline=default --load-baseline=default
+          else
+            echo "::warning::No cached baseline (new repo or cache evicted); running with --save-baseline (no comparison). Push to main to establish baseline."
+            cargo bench --bench microbench_iai -- --save-baseline=default
+          fi
+      - name: Save iai-callgrind baseline (main only, on success)
+        if: success() && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/iai
+          key: iai-baseline-v1
 
