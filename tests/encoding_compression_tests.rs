@@ -10,6 +10,8 @@ use ugnos::encoding::{
 };
 use ugnos::{DbConfig, DbCore, DbError, TagSet};
 
+mod test_manifest;
+
 const SEG_MAGIC: &[u8; 8] = b"UGNSEG01";
 
 // V2 series block header layout (encoding.rs): magic[0..8], version[8..12], row_count[12..16],
@@ -113,9 +115,18 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
     );
     let index_bytes = &seg_bytes[index_offset_usz..index_offset_usz + index_len_usz];
 
+    const INDEX_VERSION_TAG_INDEX: u8 = 2;
     let mut off = 0usize;
-    let series_count = read_u32_le(index_bytes, off) as usize;
-    off += 4;
+    let (series_count, entry_extra) = if index_bytes.len() >= 5 && index_bytes[0] == INDEX_VERSION_TAG_INDEX {
+        let count = u32::from_le_bytes(index_bytes[1..5].try_into().expect("count bytes")) as usize;
+        off = 5;
+        // version 2: after offset/len we have row_count, min_ts, max_ts, crc32, tag_index_offset, tag_index_len
+        (count, 4 + 8 + 8 + 4 + 8 + 4)
+    } else {
+        let count = read_u32_le(index_bytes, off) as usize;
+        off = 4;
+        (count, 4 + 8 + 8 + 4)
+    };
 
     let mut out: BTreeMap<String, SeriesIndexEntry> = BTreeMap::new();
     for _ in 0..series_count {
@@ -124,8 +135,7 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
         off += 8;
         let len = read_u64_le(index_bytes, off);
         off += 8;
-        // row_count (u32), min_ts (u64), max_ts (u64), crc32 (u32) — not needed here.
-        off += 4 + 8 + 8 + 4;
+        off += entry_extra;
         out.insert(name, SeriesIndexEntry { offset, len });
     }
     out
@@ -194,7 +204,7 @@ fn test_encoding_and_compression_roundtrip_with_weird_floats_and_tags() {
         compression: BlockCompression::Zstd { level: 1 },
     };
     let cfg = make_cfg(dir.path(), encoding);
-    let db = DbCore::with_config(cfg).unwrap();
+    let db = DbCore::with_config(cfg.clone()).unwrap();
 
     let series = "s";
     let mut tags0: TagSet = TagSet::new();
@@ -233,10 +243,24 @@ fn test_encoding_and_compression_roundtrip_with_weird_floats_and_tags() {
     }
     db.flush().unwrap();
 
+    // This test asserts ordering because it is a single-segment query.
+    // Global ordering across *multiple* segments is explicitly not guaranteed (see README).
+    let m = test_manifest::read_manifest(&cfg.data_dir);
+    assert_eq!(
+        m.segments.len(),
+        1,
+        "expected exactly one segment; if this becomes multi-segment, do not assume query order"
+    );
+
     // Query full range (no tags) and verify ordering + float bits preserved.
-    let mut got = db.query(series, 0..u64::MAX, None).unwrap();
-    got.sort_by_key(|(ts, _)| *ts);
+    let got = db.query(series, 0..u64::MAX, None).unwrap();
     assert_eq!(got.len(), timestamps.len());
+    // Actually verify ordering: results must be in non-decreasing timestamp order.
+    assert!(
+        got.windows(2).all(|w| w[1].0 >= w[0].0),
+        "query must return points in timestamp order, got: {:?}",
+        got.iter().map(|(ts, _)| ts).collect::<Vec<_>>()
+    );
 
     // Spot-check that at least one NaN payload survived bit-exactly.
     let want_nan_bits = values[0].to_bits();

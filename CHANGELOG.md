@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+### [0.4.0] - 2026-02-10
+
+### Added
+
+*Deliverables:*
+
+- Time index per segment/block
+  - time-range is executed via binary search (partition_point) over sorted timestamps in each series block.
+- Tag index strategy suitable for high-cardinality tags
+  * What is implemented: an inverted index using Roaring bitmaps:
+    * Per-block: `(key_id,value_id)` - RoaringBitmap(rows), compressed (zstd) + CRC.
+    * Per-segment postings: `(key_id,value_id)` - RoaringBitmap(series ordinals), compressed (zstd) + CRC.
+- Cardinality estimation and hard limits per tenant/namespace
+  - Hard limits per scope: enforced in `DbCore::insert` with a configurable scope key (`DbConfig::cardinality_scope_tag_key`) and configurable hard limit (`DbConfig::max_series_cardinality`).
+  - Durable enforcement across restart: on-disk journal+checkpoint (`src/cardinality_store.rs`) and a “restart bypass” break-it test already existed (`tests/indexing_cardinality_tests.rs`).
+  - Exact distinct series keys: implementation tracks exact distinct series keys (HashSet of canonicalized (series, sorted tags)), not an approximate estimator as was planned initially (e.g. HyperLogLog) and reflected in the Milestone 1. Exact is stronger for correctness.
+
+*Acceptance criteria:*
+
+- Tag filters avoid full scans for common workloads (measurable via query benchmark)
+  - Avoid full scan: when tag index exists, the query path computes candidate rows via Roaring bitmap intersections and returns only those rows (no per-row tag checks over the full in-range window).
+  - Proved by `breakit_corrupt_tag_index_returns_corruption`: corrupting the persisted tag index causes the query to return `DbError::Corruption` (meaning the query path does consult and validate the index, rather than silently scanning).
+  - Measurable via benchmark: Criterion benches include `segments_query/*_range_with_tag_filter` (and an in-memory analog), which is exactly the “measurable” part of the AC.
+- Configurable hard limit returns explicit error + metrics
+  - Explicit error: `DbError::SeriesCardinalityLimitExceeded { current, limit, scope }`.
+  - Metrics: counter `ugnos_cardinality_limit_rejections{scope=...}` and gauge `ugnos_series_cardinality{scope=...}`.
+  - Proved by a test `cardinality_limit_rejection_emits_explicit_error_and_metrics` : inserting a series beyond the limit returns `DbError::SeriesCardinalityLimitExceeded`.
+
+New test files: `tests/cardinality_metrics_tests.rs`, `tests/indexing_cardinality_tests.rs`, `tests/segment_postings_index_tests.rs`, `tests/tag_index_corruption_tests.rs`, `tests/test_manifest.rs`
+
+Note: Modern practice alignment
+
+- High-cardinality tag indexing: inverted index + bitmap postings (Roaring) is a mainstream approach for fast AND intersections and compact storage; see the Roaring bitmap performance/usage references and high-cardinality discussions in observability/data systems, e.g. ClickHouse engineering writeups ([High Cardinality: The slow observability challenge](https://clickhouse.com/resources/engineering/high-cardinality-slow-observability-challenge)) and Roaring bitmap docs ([Roaring Bitmap Benchmarks](https://biscuit.readthedocs.io/en/latest/benchmark_roaring.html)).
+- Per-tenant cardinality management: documented best practice in metrics systems (tenant quotas + explicit limits + observability), e.g. [Grafana Enterprise Metrics cardinality management](https://grafana.com/docs/enterprise-metrics/latest/manage/tenant-management/cardinality-management) and [InfluxDB guidance](https://docs.influxdata.com/influxdb/cloud/write-data/best-practices/resolve-high-cardinality/).
+
+## [Released]
+
 ### [0.3.1] - 2026-02-07
 
 ### Added

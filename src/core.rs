@@ -2,6 +2,8 @@
 
 use crate::buffer::WriteBuffer;
 use crate::error::DbError;
+use crate::cardinality_store::CardinalityStore;
+use crate::index::{CardinalityTracker, SeriesKey, DEFAULT_CARDINALITY_SCOPE};
 use crate::persistence::{Snapshotter, WriteAheadLog};
 use crate::query::execute_query;
 use crate::segments::{SegmentStore, SegmentStoreConfig};
@@ -57,6 +59,16 @@ pub struct DbConfig {
     pub retention_check_interval: Duration,
     /// Structured event hook for observability (no-op by default).
     pub event_listener: Arc<dyn DbEventListener>,
+    /// Optional hard limit for series cardinality (distinct series keys per scope).
+    /// When set, inserts that would exceed the limit return `SeriesCardinalityLimitExceeded` and metrics.
+    pub max_series_cardinality: Option<u64>,
+    /// Optional tag key that identifies the cardinality scope (tenant/namespace).
+    ///
+    /// When set, `DbCore::insert` derives `scope` from `tags[cardinality_scope_tag_key]` and enforces
+    /// limits per-scope, aligning with tenant-level cardinality management patterns.
+    ///
+    /// If the tag key is missing (or empty), the default scope is used.
+    pub cardinality_scope_tag_key: Option<String>,
 }
 
 impl Default for DbConfig {
@@ -73,6 +85,8 @@ impl Default for DbConfig {
             retention_ttl: None,
             retention_check_interval: Duration::from_secs(1),
             event_listener: noop_event_listener(),
+            max_series_cardinality: None,
+            cardinality_scope_tag_key: None,
         }
     }
 }
@@ -96,6 +110,10 @@ pub struct DbCore {
     segment_store: Option<Arc<SegmentStore>>,
     /// Monotonic sequence generator for WAL/segments.
     next_seq: Arc<AtomicU64>,
+    /// Cardinality tracker for series limit enforcement.
+    cardinality: Arc<CardinalityTracker>,
+    /// Durable cardinality state (only when cardinality limit is enabled).
+    cardinality_store: Option<Arc<CardinalityStore>>,
     /// Database configuration.
     config: DbConfig,
 }
@@ -135,6 +153,21 @@ impl DbCore {
             .map(|s| s.max_persisted_seq())
             .unwrap_or(0);
         let next_seq = Arc::new(AtomicU64::new(max_persisted_seq.saturating_add(1)));
+        let cardinality = Arc::new(CardinalityTracker::new(config.max_series_cardinality));
+
+        // Durable cardinality: seed from on-disk state so restarts cannot bypass limits.
+        let cardinality_store = if config.max_series_cardinality.is_some() {
+            let store = Arc::new(CardinalityStore::open(config.data_dir.join("cardinality"))?);
+            for (scope, keys) in store.load_all_scopes()? {
+                cardinality.seed_series_keys(&scope, keys.iter().cloned());
+                // Best-effort compaction: materialize a deduped checkpoint and truncate the journal
+                // to keep restarts bounded. Failure here must not block DB startup.
+                let _ = store.checkpoint_scope(&scope, &keys);
+            }
+            Some(store)
+        } else {
+            None
+        };
 
         // Initialize persistence components if enabled
         let wal = if config.enable_wal {
@@ -517,6 +550,8 @@ impl DbCore {
             snapshotter,
             segment_store,
             next_seq,
+            cardinality,
+            cardinality_store,
             config,
         })
     }
@@ -728,6 +763,37 @@ impl DbCore {
             value,
             tags: tags.clone(),
         };
+
+        // Enforce series cardinality limit before WAL and buffer (per-scope).
+        let scope = self
+            .config
+            .cardinality_scope_tag_key
+            .as_deref()
+            .and_then(|k| tags.get(k))
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
+
+        let was_new = match self
+            .cardinality
+            .register_and_was_new(scope, series, &tags)
+        {
+            Ok(was_new) => was_new,
+            Err(e) => {
+                db_metrics::record_cardinality_limit_rejected(scope);
+                return Err(e);
+            }
+        };
+
+        // Persist newly observed keys (fail-closed if durability cannot be guaranteed).
+        if was_new {
+            if let Some(store) = &self.cardinality_store {
+                let key = SeriesKey::new(series, &tags);
+                store.append_scope_key(scope, &key)?;
+            }
+        }
+
+        db_metrics::record_series_cardinality(scope, self.cardinality.current_count(scope));
 
         // Log to WAL if enabled
         if let Some(wal) = &self.wal {

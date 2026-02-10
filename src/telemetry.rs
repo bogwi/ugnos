@@ -78,6 +78,13 @@ pub mod db_metrics {
     pub const SNAPSHOT_DURATION_SECONDS: &str = "ugnos_snapshot_duration_seconds";
     pub const SNAPSHOT_SIZE_BYTES: &str = "ugnos_snapshot_size_bytes";
 
+    /// Cardinality limit rejections (insert rejected due to series cardinality limit).
+    pub const CARDINALITY_LIMIT_REJECTIONS: &str = "ugnos_cardinality_limit_rejections";
+    /// Current series cardinality (distinct series keys) per scope.
+    pub const SERIES_CARDINALITY: &str = "ugnos_series_cardinality";
+    /// Segment-level postings skips (query avoided reading a series block due to postings index).
+    pub const TAG_POSTINGS_SEGMENT_SKIPS: &str = "ugnos_tag_postings_segment_skips";
+
     /// Handle to the in-process Prometheus recorder/scrape renderer.
     ///
     /// This does **not** start an HTTP server. Call [`InProcessPrometheus::render`] to scrape.
@@ -200,6 +207,26 @@ pub mod db_metrics {
         ::metrics::gauge!(SNAPSHOT_SIZE_BYTES).set(size_bytes as f64);
     }
 
+    /// Records a rejection due to series cardinality limit (call when insert returns
+    /// `DbError::SeriesCardinalityLimitExceeded`).
+    #[inline]
+    pub fn record_cardinality_limit_rejected(scope: &str) {
+        ::metrics::counter!(CARDINALITY_LIMIT_REJECTIONS, "scope" => scope.to_string())
+            .increment(1);
+    }
+
+    /// Updates the current series cardinality gauge for the given scope.
+    #[inline]
+    pub fn record_series_cardinality(scope: &str, count: u64) {
+        ::metrics::gauge!(SERIES_CARDINALITY, "scope" => scope.to_string()).set(count as f64);
+    }
+
+    /// Records a segment-level postings skip.
+    #[inline]
+    pub fn record_tag_postings_segment_skip() {
+        ::metrics::counter!(TAG_POSTINGS_SEGMENT_SKIPS).increment(1);
+    }
+
     fn describe_all() {
         // Counters
         describe_counter!(
@@ -245,6 +272,21 @@ pub mod db_metrics {
             SNAPSHOT_SIZE_BYTES,
             Unit::Bytes,
             "Size of the most recently created snapshot file."
+        );
+        describe_counter!(
+            CARDINALITY_LIMIT_REJECTIONS,
+            Unit::Count,
+            "Number of inserts rejected due to series cardinality limit."
+        );
+        describe_counter!(
+            TAG_POSTINGS_SEGMENT_SKIPS,
+            Unit::Count,
+            "Number of times segment-level postings avoided reading a non-matching series block."
+        );
+        describe_gauge!(
+            SERIES_CARDINALITY,
+            Unit::Count,
+            "Current number of distinct series (series key = series name + tag set) per scope."
         );
     }
 }
