@@ -27,8 +27,11 @@ This crate is a **library-grade database core** intended to be embedded into a R
   - Immutable segment files with per-series columnar blocks; **block-level checksums** and **versioning** (v2 header with payload CRC32 and version field).
   - **Timestamp delta encoding** (varint) for series blocks; configurable float encoding strategies (**Raw64**, **GorillaXor**).
   - **Tag dictionary encoding**; optional per-block compression (**LZ4**, **Zstd** with configurable level).
+  - **Time index** per segment/block (time-range via binary search); **tag index** (inverted index with Roaring bitmaps) for tag filters without full scans.
   - Atomic manifest (`MANIFEST.bin`) tracking active segments and retention watermark.
   - Background compaction (L0 → L1 merge) with safe concurrent reads.
+- **Indexing & cardinality**:
+  - Tag filters use the tag index (bitmap intersection); configurable **series cardinality** hard limit per scope with explicit error and metrics.
 - **Retention/TTL**:
   - Immediate logical deletion via tombstone watermark.
   - Physical removal via compaction guarantees.
@@ -93,13 +96,18 @@ cfg.retention_check_interval = Duration::from_secs(1);
 cfg.segment_store.encoding.float_encoding = ugnos::encoding::FloatEncoding::GorillaXor;
 cfg.segment_store.encoding.compression = ugnos::encoding::BlockCompression::Zstd { level: 3 };
 
+// Cardinality (optional): hard limit for distinct series per scope; scope from tags[cardinality_scope_tag_key].
+// When exceeded, insert returns DbError::SeriesCardinalityLimitExceeded and metrics (ugnos_cardinality_limit_rejections, ugnos_series_cardinality).
+// cfg.max_series_cardinality = Some(100);
+// cfg.cardinality_scope_tag_key = Some("tenant".to_string());
+
 let mut db = DbCore::with_config(cfg).unwrap();
 db.recover().unwrap();
 ```
 
 ## Observability (event hook)
 
-Core emits structured events via `DbConfig.event_listener`:
+Core emits structured events via `DbConfig.event_listener`. With cardinality limits enabled, telemetry exposes `ugnos_cardinality_limit_rejections` and `ugnos_series_cardinality` (when using the Prometheus recorder).
 
 ```rust,no_run
 use std::sync::{Arc, Mutex};
@@ -191,5 +199,3 @@ This project is licensed under either of
 * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 
 at your option.
-
-

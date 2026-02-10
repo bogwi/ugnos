@@ -1,12 +1,15 @@
 use crate::encoding::{
-    crc32, decode_series_block_v1_all_rows, decode_series_block_v1_for_query,
+    build_tag_block_index, crc32, decode_series_block_v1_all_rows, decode_series_block_v1_for_query,
     decode_series_block_v2_all_rows, decode_series_block_v2_for_query, encode_series_block,
-    read_u32, read_u64, write_u32, write_u64, SegmentEncodingConfig,
+    parse_tag_block_index, read_u32, read_u64, read_var_u32, write_u32, write_u64, write_var_u32,
+    SegmentEncodingConfig,
+    TagBlockIndex,
 };
 use crate::error::DbError;
 use crate::types::{Row, TagSet, Timestamp, Value};
 
 use crc32fast::Hasher as Crc32;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -19,6 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SEG_MAGIC: &[u8; 8] = b"UGNSEG01";
 const SEG_FOOTER_MAGIC: &[u8; 8] = b"UGNSEGF1";
 const MANIFEST_MAGIC: &[u8; 8] = b"UGNMAN01";
+const SEG_POSTINGS_MAGIC: &[u8; 8] = b"UGNTPOS1";
+const SEG_POSTINGS_VERSION: u32 = 1;
 
 const SEG_VERSION: u32 = 2;
 const MANIFEST_VERSION: u32 = 1;
@@ -29,6 +34,9 @@ const FOOTER_LEN: u64 = 8 + 8 + 8 + 4; // magic + index_off + index_len + crc32
 pub struct SegmentStoreConfig {
     pub compaction_check_interval: Duration,
     pub l0_compaction_trigger_segment_count: usize,
+    /// When true, build and store a per-block tag index (inverted index) so tag filters
+    /// avoid full scans over in-range rows.
+    pub enable_tag_index: bool,
     /// Optional trigger: compact L0 when total bytes across all L0 segments reaches/exceeds this value.
     ///
     /// Note: bytes are computed from on-disk file sizes (best-effort).
@@ -46,6 +54,7 @@ impl Default for SegmentStoreConfig {
             l0_compaction_trigger_segment_count: 4,
             l0_compaction_trigger_total_bytes: None,
             l0_compaction_trigger_max_age: None,
+            enable_tag_index: true,
             encoding: SegmentEncodingConfig::default(),
         }
     }
@@ -66,6 +75,7 @@ pub struct SegmentStore {
     state: Arc<RwLock<StoreState>>,
 
     encoding: SegmentEncodingConfig,
+    enable_tag_index: bool,
 
     compaction_tx: mpsc::Sender<CompactionCmd>,
     compaction_handle: Mutex<Option<JoinHandle<()>>>,
@@ -99,6 +109,12 @@ struct SegmentRecord {
     max_ts: Timestamp,
     file_name: String,
     series: BTreeMap<String, SeriesBlockMeta>,
+    /// Optional segment-level postings index offset (0 = none).
+    #[serde(default)]
+    tag_postings_offset: u64,
+    /// Optional segment-level postings index length (0 = none).
+    #[serde(default)]
+    tag_postings_len: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -109,12 +125,79 @@ pub(crate) struct SeriesBlockMeta {
     pub min_ts: Timestamp,
     pub max_ts: Timestamp,
     pub crc32: u32,
+    /// Offset of optional tag block index (0 = no index).
+    #[serde(default)]
+    pub tag_index_offset: u64,
+    /// Length of tag block index (0 = no index).
+    #[serde(default)]
+    pub tag_index_len: u32,
 }
 
 #[derive(Debug)]
 struct Segment {
     rec: SegmentRecord,
     path: PathBuf,
+    series_ord: HashMap<String, u32>,
+    postings_cache: Mutex<Option<SegmentTagPostingsIndex>>,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentTagPostingsIndex {
+    series_count: u32,
+    str_to_id: HashMap<String, u32>,
+    /// (kid, vid) -> series ordinals bitmap.
+    bitmaps: HashMap<(u32, u32), RoaringBitmap>,
+}
+
+impl SegmentTagPostingsIndex {
+    fn series_might_match(&self, series_ord: u32, filter: &TagSet) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        if series_ord >= self.series_count {
+            return false;
+        }
+        for (k, v) in filter {
+            let Some(&kid) = self.str_to_id.get(k) else {
+                return false;
+            };
+            let Some(&vid) = self.str_to_id.get(v) else {
+                return false;
+            };
+            let Some(bm) = self.bitmaps.get(&(kid, vid)) else {
+                return false;
+            };
+            if !bm.contains(series_ord) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Segment {
+    fn postings_might_match(&self, series_ord: u32, filter: &TagSet) -> Result<bool, DbError> {
+        if filter.is_empty() {
+            return Ok(true);
+        }
+        if self.rec.tag_postings_len == 0 {
+            return Ok(true);
+        }
+
+        let mut guard = self.postings_cache.lock()?;
+        if guard.is_none() {
+            let mut f = File::open(&self.path)?;
+            f.seek(SeekFrom::Start(self.rec.tag_postings_offset))?;
+            let mut buf = vec![0u8; self.rec.tag_postings_len as usize];
+            f.read_exact(&mut buf)?;
+            let idx = parse_segment_postings_index(&buf, &self.path)?;
+            *guard = Some(idx);
+        }
+        Ok(guard
+            .as_ref()
+            .map(|idx| idx.series_might_match(series_ord, filter))
+            .unwrap_or(true))
+    }
 }
 
 #[derive(Debug)]
@@ -152,9 +235,17 @@ impl SegmentStore {
             let path = segments_dir.join(&rec.file_name);
             // Validate footer/index CRC early; also normalizes any future upgrades.
             let _ = load_segment_index(&path)?;
+            let series_ord: HashMap<String, u32> = rec
+                .series
+                .keys()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i as u32))
+                .collect();
             active.push(Arc::new(Segment {
                 rec: rec.clone(),
                 path,
+                series_ord,
+                postings_cache: Mutex::new(None),
             }));
         }
 
@@ -174,8 +265,6 @@ impl SegmentStore {
         let tmp_dir_clone = tmp_dir.clone();
         let manifest_path_clone = manifest_path.clone();
         let cfg_clone = config.clone();
-        let encoding = config.encoding.clone();
-
         let handle = thread::spawn(move || {
             compaction_loop(
                 rx,
@@ -192,7 +281,8 @@ impl SegmentStore {
             segments_dir,
             tmp_dir,
             state,
-            encoding,
+            encoding: config.encoding.clone(),
+            enable_tag_index: config.enable_tag_index,
             compaction_tx: tx,
             compaction_handle: Mutex::new(Some(handle)),
         })
@@ -286,6 +376,7 @@ impl SegmentStore {
             delete_before,
             rows_by_series,
             &self.encoding,
+            self.enable_tag_index,
         )?;
 
         // Install into manifest + active set atomically.
@@ -293,9 +384,17 @@ impl SegmentStore {
             let mut st = self.state.write()?;
             st.manifest.segments.push(rec.clone());
             write_manifest_atomic(&self.manifest_path, &self.tmp_dir, &st.manifest)?;
+            let series_ord: HashMap<String, u32> = rec
+                .series
+                .keys()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i as u32))
+                .collect();
             st.active.push(Arc::new(Segment {
                 rec: rec.clone(),
                 path: final_path,
+                series_ord,
+                postings_cache: Mutex::new(None),
             }));
         }
 
@@ -338,6 +437,22 @@ impl SegmentStore {
             seen_series = true;
             if meta.max_ts < time_range.start || meta.min_ts >= time_range.end {
                 continue;
+            }
+
+            // Segment-level postings index (tag kv -> series blocks): skip reading the series block
+            // entirely when we can prove no rows in this series block can match the tag filter.
+            if let Some(filter) = tag_filter {
+                if seg.rec.tag_postings_len > 0 {
+                    let ord = seg
+                        .series_ord
+                        .get(series)
+                        .copied()
+                        .ok_or_else(|| DbError::Internal("Missing series ordinal".to_string()))?;
+                    if !seg.postings_might_match(ord, filter)? {
+                        crate::telemetry::db_metrics::record_tag_postings_segment_skip();
+                        continue;
+                    }
+                }
             }
 
             let mut results = read_series_range(
@@ -403,7 +518,7 @@ fn compaction_loop(
             Ok(CompactionCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(CompactionCmd::Force { ack }) => {
                 let res =
-                    compact_l0_once(&state, segments_dir, tmp_dir, manifest_path, &cfg.encoding);
+                    compact_l0_once(&state, segments_dir, tmp_dir, manifest_path, &cfg);
                 let _ = ack.send(res);
             }
             Ok(CompactionCmd::Maybe) | Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -426,7 +541,7 @@ fn maybe_compact(
     // Retention reclamation is correctness-agnostic (queries already obey tombstone), but critical for
     // enterprise operational guarantees: eventually reclaim disk for expired data even if no new
     // flushes/compactions happen and even if only a single segment exists.
-    reclaim_retention(state, segments_dir, tmp_dir, manifest_path, &cfg.encoding)?;
+    reclaim_retention(state, segments_dir, tmp_dir, manifest_path, cfg)?;
 
     let (l0, l0_total_bytes, oldest_created_at) = {
         let st = state.read()?;
@@ -464,7 +579,7 @@ fn maybe_compact(
 
     // L0 compaction is a merge; require at least two segments.
     if should_compact && l0.len() >= 2 {
-        let _ = compact_l0_once(state, segments_dir, tmp_dir, manifest_path, &cfg.encoding)?;
+        let _ = compact_l0_once(state, segments_dir, tmp_dir, manifest_path, cfg)?;
     }
     Ok(())
 }
@@ -474,7 +589,7 @@ fn reclaim_retention(
     segments_dir: &Path,
     tmp_dir: &Path,
     manifest_path: &Path,
-    encoding: &SegmentEncodingConfig,
+    cfg: &SegmentStoreConfig,
 ) -> Result<(), DbError> {
     let (delete_before, segments) = {
         let st = state.read()?;
@@ -540,7 +655,8 @@ fn reclaim_retention(
             created_at,
             Some(delete_before),
             filtered,
-            encoding,
+            &cfg.encoding,
+            cfg.enable_tag_index,
         )?;
 
         // Atomically replace the segment in manifest + active set.
@@ -561,9 +677,17 @@ fn reclaim_retention(
                 }
             }
             st.obsolete.extend(new_obsolete);
+            let series_ord: HashMap<String, u32> = new_rec
+                .series
+                .keys()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i as u32))
+                .collect();
             new_active.push(Arc::new(Segment {
                 rec: new_rec.clone(),
                 path: final_path,
+                series_ord,
+                postings_cache: Mutex::new(None),
             }));
             st.active = new_active;
         }
@@ -600,7 +724,7 @@ fn compact_l0_once(
     segments_dir: &Path,
     tmp_dir: &Path,
     manifest_path: &Path,
-    encoding: &SegmentEncodingConfig,
+    cfg: &SegmentStoreConfig,
 ) -> Result<CompactionStats, DbError> {
     // Select L0 segments to compact.
     let (to_compact, delete_before) = {
@@ -691,7 +815,8 @@ fn compact_l0_once(
         created_at,
         Some(delete_before),
         merged,
-        encoding,
+        &cfg.encoding,
+        cfg.enable_tag_index,
     )?;
 
     // Install: remove old L0 from active list, add new L1, persist manifest.
@@ -715,9 +840,17 @@ fn compact_l0_once(
             }
         }
         st.obsolete.extend(new_obsolete);
+        let series_ord: HashMap<String, u32> = new_rec
+            .series
+            .keys()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i as u32))
+            .collect();
         new_active.push(Arc::new(Segment {
             rec: new_rec.clone(),
             path: final_path,
+            series_ord,
+            postings_cache: Mutex::new(None),
         }));
         st.active = new_active;
     }
@@ -759,6 +892,7 @@ fn write_segment_file(
     delete_before: Option<Timestamp>,
     rows_by_series: HashMap<String, Vec<Row>>,
     encoding: &SegmentEncodingConfig,
+    enable_tag_index: bool,
 ) -> Result<SegmentRecord, DbError> {
     // Build series blocks in a deterministic order.
     let mut series_names: Vec<String> = rows_by_series.keys().cloned().collect();
@@ -816,6 +950,19 @@ fn write_segment_file(
         seg_max_ts = seg_max_ts.max(max_ts);
         seg_max_seq = seg_max_seq.max(max_seq);
 
+        let (tag_index_offset, tag_index_len) = if enable_tag_index {
+            match build_tag_block_index(rows) {
+                Ok(index_bytes) => {
+                    let off = w.stream_position()?;
+                    w.write_all(&index_bytes)?;
+                    (off, index_bytes.len() as u32)
+                }
+                Err(_) => (0, 0),
+            }
+        } else {
+            (0, 0)
+        };
+
         series_meta.insert(
             series.clone(),
             SeriesBlockMeta {
@@ -825,6 +972,8 @@ fn write_segment_file(
                 min_ts,
                 max_ts,
                 crc32: block_crc32,
+                tag_index_offset,
+                tag_index_len,
             },
         );
     }
@@ -835,9 +984,26 @@ fn write_segment_file(
         ));
     }
 
-    // Index
+    // Segment-level postings index: (tag key,value) -> bitmap(series ordinals).
+    // This allows tag filters to skip reading entire series blocks within a segment.
+    let (tag_postings_offset, tag_postings_len) = if enable_tag_index {
+        match build_segment_postings_index(&rows_by_series, &series_names) {
+            Ok(bytes) if !bytes.is_empty() => {
+                let off = w.stream_position()?;
+                w.write_all(&bytes)?;
+                (off, bytes.len() as u32)
+            }
+            _ => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
+
+    // Index (version 2: includes tag index offset/length per series)
+    const INDEX_VERSION_TAG_INDEX: u8 = 2;
     let index_offset = w.stream_position()?;
     let mut index_buf = Vec::new();
+    index_buf.push(INDEX_VERSION_TAG_INDEX);
     write_u32(&mut index_buf, series_meta.len() as u32);
     for (name, meta) in &series_meta {
         write_string(&mut index_buf, name);
@@ -847,6 +1013,8 @@ fn write_segment_file(
         write_u64(&mut index_buf, meta.min_ts);
         write_u64(&mut index_buf, meta.max_ts);
         write_u32(&mut index_buf, meta.crc32);
+        write_u64(&mut index_buf, meta.tag_index_offset);
+        write_u32(&mut index_buf, meta.tag_index_len);
     }
     let index_len = index_buf.len() as u64;
     w.write_all(&index_buf)?;
@@ -888,12 +1056,237 @@ fn write_segment_file(
             .to_string_lossy()
             .into_owned(),
         series: series_meta,
+        tag_postings_offset,
+        tag_postings_len,
     };
 
     // Sanity: index can be read back.
     let _ = load_segment_index(final_path)?;
     let _ = size;
     Ok(rec)
+}
+
+fn build_segment_postings_index(
+    rows_by_series: &HashMap<String, Vec<Row>>,
+    series_names: &[String],
+) -> Result<Vec<u8>, DbError> {
+    let series_count: u32 = series_names
+        .len()
+        .try_into()
+        .map_err(|_| DbError::Internal("Too many series for postings index".to_string()))?;
+
+    // Build a global dictionary of all tag strings (keys + values) for this segment.
+    let mut uniq: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for series in series_names {
+        if let Some(rows) = rows_by_series.get(series) {
+            for r in rows {
+                for (k, v) in &r.tags {
+                    uniq.insert(k.clone());
+                    uniq.insert(v.clone());
+                }
+            }
+        }
+    }
+    let dict: Vec<String> = uniq.into_iter().collect();
+    if dict.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut str_to_id: HashMap<String, u32> = HashMap::with_capacity(dict.len());
+    for (i, s) in dict.iter().enumerate() {
+        str_to_id.insert(s.clone(), i as u32);
+    }
+
+    // Build postings: (kid,vid) -> bitmap(series ordinals).
+    let mut bitmaps: BTreeMap<(u32, u32), RoaringBitmap> = BTreeMap::new();
+    for (ord, series) in series_names.iter().enumerate() {
+        let ord: u32 = ord as u32;
+        let Some(rows) = rows_by_series.get(series) else {
+            continue;
+        };
+        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        for r in rows {
+            for (k, v) in &r.tags {
+                let Some(&kid) = str_to_id.get(k) else { continue };
+                let Some(&vid) = str_to_id.get(v) else { continue };
+                seen.insert((kid, vid));
+            }
+        }
+        for (kid, vid) in seen {
+            bitmaps.entry((kid, vid)).or_default().insert(ord);
+        }
+    }
+
+    // Raw payload: dict + entries.
+    let mut raw = Vec::new();
+    write_var_u32(&mut raw, dict.len() as u32);
+    for s in &dict {
+        let b = s.as_bytes();
+        let n: u32 = b
+            .len()
+            .try_into()
+            .map_err(|_| DbError::Internal("Dictionary string too large".to_string()))?;
+        write_var_u32(&mut raw, n);
+        raw.extend_from_slice(b);
+    }
+    write_var_u32(&mut raw, bitmaps.len() as u32);
+    for ((kid, vid), bm) in &bitmaps {
+        write_var_u32(&mut raw, *kid);
+        write_var_u32(&mut raw, *vid);
+        let mut bm_bytes = Vec::new();
+        bm.serialize_into(&mut bm_bytes)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let n: u32 = bm_bytes
+            .len()
+            .try_into()
+            .map_err(|_| DbError::Internal("Postings bitmap too large".to_string()))?;
+        write_var_u32(&mut raw, n);
+        raw.extend_from_slice(&bm_bytes);
+    }
+
+    // Wrap + compress payload and append CRC.
+    let raw_len: u32 = raw
+        .len()
+        .try_into()
+        .map_err(|_| DbError::Internal("Postings payload too large".to_string()))?;
+    let zstd = zstd::stream::encode_all(std::io::Cursor::new(&raw), 3).map_err(DbError::Io)?;
+    let zstd_len: u32 = zstd
+        .len()
+        .try_into()
+        .map_err(|_| DbError::Internal("Postings compressed payload too large".to_string()))?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(SEG_POSTINGS_MAGIC);
+    write_u32(&mut out, SEG_POSTINGS_VERSION);
+    write_var_u32(&mut out, series_count);
+    write_var_u32(&mut out, raw_len);
+    write_var_u32(&mut out, zstd_len);
+    out.extend_from_slice(&zstd);
+    let crc = crc32(&out);
+    write_u32(&mut out, crc);
+    Ok(out)
+}
+
+fn parse_segment_postings_index(bytes: &[u8], path: &Path) -> Result<SegmentTagPostingsIndex, DbError> {
+    if bytes.len() < 8 + 4 + 4 {
+        return Err(DbError::Corruption {
+            details: format!("Truncated postings index in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let mut cur = std::io::Cursor::new(bytes);
+    let mut magic = [0u8; 8];
+    cur.read_exact(&mut magic)?;
+    if &magic != SEG_POSTINGS_MAGIC {
+        return Err(DbError::Corruption {
+            details: format!("Bad postings index magic in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let version = read_u32(&mut cur)?;
+    if version != SEG_POSTINGS_VERSION {
+        return Err(DbError::Corruption {
+            details: format!("Unsupported postings index version {} in {:?}", version, path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let series_count = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })?;
+    let raw_len = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    let zstd_len = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    let mut zstd = vec![0u8; zstd_len];
+    cur.read_exact(&mut zstd)?;
+    let raw = zstd::stream::decode_all(std::io::Cursor::new(&zstd)).map_err(DbError::Io)?;
+    if raw.len() != raw_len {
+        return Err(DbError::Corruption {
+            details: format!("Postings payload length mismatch in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let expected_crc = read_u32(&mut cur)?;
+    if bytes.len() < 4 {
+        return Err(DbError::Corruption {
+            details: format!("Truncated postings index in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let actual_crc = crc32(&bytes[..bytes.len() - 4]);
+    if expected_crc != actual_crc {
+        return Err(DbError::Corruption {
+            details: format!("Postings index CRC mismatch in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+
+    let mut payload = std::io::Cursor::new(&raw);
+    let dict_count = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    let mut str_to_id: HashMap<String, u32> = HashMap::with_capacity(dict_count);
+    for i in 0..dict_count {
+        let n = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let mut b = vec![0u8; n];
+        payload.read_exact(&mut b)?;
+        let s = String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?;
+        str_to_id.insert(s, i as u32);
+    }
+    let entry_count = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    let mut bitmaps: HashMap<(u32, u32), RoaringBitmap> = HashMap::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let kid = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })?;
+        let vid = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })?;
+        let n = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let mut bm_bytes = vec![0u8; n];
+        payload.read_exact(&mut bm_bytes)?;
+        let mut rdr = std::io::Cursor::new(&bm_bytes);
+        let bm = RoaringBitmap::deserialize_from(&mut rdr)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        bitmaps.insert((kid, vid), bm);
+    }
+
+    Ok(SegmentTagPostingsIndex {
+        series_count,
+        str_to_id,
+        bitmaps,
+    })
 }
 
 fn read_series_range(
@@ -958,16 +1351,95 @@ fn read_series_range(
 
             let mut out = Vec::new();
             if let Some(filter) = tag_filter {
-                let matcher = decoded.build_tag_filter_matcher(filter);
-                if matcher.is_none() {
-                    return Ok(Vec::new());
-                }
-                let matcher = matcher.unwrap();
-                for i in start_idx..end_idx {
-                    if !decoded.row_matches_filter_v2(i, &matcher)? {
-                        continue;
+                // Use tag block index when available to avoid full scan of in-range rows.
+                let use_index = meta.tag_index_len > 0;
+                if use_index {
+                    let mut index_buf = vec![0u8; meta.tag_index_len as usize];
+                    f.seek(SeekFrom::Start(meta.tag_index_offset))?;
+                    f.read_exact(&mut index_buf)?;
+                    let idx = parse_tag_block_index(&index_buf, path)?;
+                    // Defensive validation: index row_count must match decoded block row count.
+                    if let crate::encoding::TagBlockIndex::RoaringV3 { row_count, .. } = &idx {
+                        if *row_count != decoded.timestamps.len() {
+                            return Err(DbError::Corruption {
+                                details: format!(
+                                    "Tag index row_count {} != block row_count {} in {:?}",
+                                    row_count,
+                                    decoded.timestamps.len(),
+                                    path
+                                ),
+                                series: None,
+                                timestamp: None,
+                            });
+                        }
                     }
-                    out.push((decoded.timestamps[i], decoded.values[i]));
+                    // v3 fast-path: avoid dictionary/string work by using the block's matcher.
+                    if let Some(matcher) = decoded.build_tag_filter_matcher(filter) {
+                        if let Some(candidates) = idx.candidates_for_matcher_v2(&matcher) {
+                            // Empty matcher => no tag filtering; return whole in-range window.
+                            if matcher.pairs.is_empty() {
+                                for i in start_idx..end_idx {
+                                    out.push((decoded.timestamps[i], decoded.values[i]));
+                                }
+                            } else {
+                                let start_u = start_idx as u32;
+                                let end_u = end_idx as u32;
+                                for ri in candidates.iter() {
+                                    if ri < start_u {
+                                        continue;
+                                    }
+                                    if ri >= end_u {
+                                        break;
+                                    }
+                                    let i = ri as usize;
+                                    out.push((decoded.timestamps[i], decoded.values[i]));
+                                }
+                            }
+                            return Ok(out);
+                        }
+                    } else {
+                        // Filter contains terms not present in the block dictionary => no match.
+                        return Ok(Vec::new());
+                    }
+
+                    // Legacy fallback (older on-disk index versions).
+                    match idx.candidates_for_filter(filter) {
+                        None => return Ok(Vec::new()),
+                        Some(crate::encoding::TagIndexCandidates::All) => {
+                            for i in start_idx..end_idx {
+                                out.push((decoded.timestamps[i], decoded.values[i]));
+                            }
+                        }
+                        Some(crate::encoding::TagIndexCandidates::Bitmap(bitmap)) => {
+                            for i in start_idx..end_idx {
+                                if TagBlockIndex::bitmap_get(&bitmap, decoded.timestamps.len(), i) {
+                                    out.push((decoded.timestamps[i], decoded.values[i]));
+                                }
+                            }
+                        }
+                        Some(crate::encoding::TagIndexCandidates::Rows(rows)) => {
+                            let start_u = start_idx as u32;
+                            let end_u = end_idx as u32;
+                            let a = rows.partition_point(|&x| x < start_u);
+                            let b = rows.partition_point(|&x| x < end_u);
+                            for &ri in &rows[a..b] {
+                                let i = ri as usize;
+                                out.push((decoded.timestamps[i], decoded.values[i]));
+                            }
+                        }
+                    }
+                } else {
+                    let matcher = decoded.build_tag_filter_matcher(filter);
+                    if matcher.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    let matcher = matcher.unwrap();
+                    for i in start_idx..end_idx {
+                        if !decoded.row_matches_filter_v2(i, &matcher)? {
+                            continue;
+                        }
+                        out.push((decoded.timestamps[i], decoded.values[i]));
+                    }
                 }
             } else {
                 for i in start_idx..end_idx {
@@ -1088,13 +1560,35 @@ fn load_segment_index(path: &Path) -> Result<BTreeMap<String, SeriesBlockMeta>, 
         });
     }
 
-    // Index
+    // Index (version 2 has tag index fields; old segments have no version byte)
+    const INDEX_VERSION_TAG_INDEX: u8 = 2;
     f.seek(SeekFrom::Start(index_offset))?;
     let mut index_bytes = vec![0u8; index_len as usize];
     f.read_exact(&mut index_bytes)?;
+    let (series_count, has_tag_index) = if index_bytes.len() >= 5 && index_bytes[0] == INDEX_VERSION_TAG_INDEX {
+        let count = u32::from_le_bytes([
+            index_bytes[1],
+            index_bytes[2],
+            index_bytes[3],
+            index_bytes[4],
+        ]) as usize;
+        (count, true)
+    } else {
+        let count = u32::from_le_bytes([
+            index_bytes[0],
+            index_bytes[1],
+            index_bytes[2],
+            index_bytes[3],
+        ]) as usize;
+        (count, false)
+    };
     let mut cur = std::io::Cursor::new(index_bytes);
+    if has_tag_index {
+        cur.set_position(5);
+    } else {
+        cur.set_position(4);
+    }
 
-    let series_count = read_u32(&mut cur)? as usize;
     let mut out = BTreeMap::new();
     for _ in 0..series_count {
         let name = read_string(&mut cur)?;
@@ -1104,6 +1598,11 @@ fn load_segment_index(path: &Path) -> Result<BTreeMap<String, SeriesBlockMeta>, 
         let min_ts = read_u64(&mut cur)?;
         let max_ts = read_u64(&mut cur)?;
         let crc32 = read_u32(&mut cur)?;
+        let (tag_index_offset, tag_index_len) = if has_tag_index {
+            (read_u64(&mut cur)?, read_u32(&mut cur)?)
+        } else {
+            (0, 0)
+        };
         out.insert(
             name,
             SeriesBlockMeta {
@@ -1113,6 +1612,8 @@ fn load_segment_index(path: &Path) -> Result<BTreeMap<String, SeriesBlockMeta>, 
                 min_ts,
                 max_ts,
                 crc32,
+                tag_index_offset,
+                tag_index_len,
             },
         );
     }

@@ -4,7 +4,8 @@ use crate::error::DbError;
 use crate::types::{Row, TagSet, Timestamp, Value};
 
 use crc32fast::Hasher as Crc32;
-use std::collections::HashMap;
+use roaring::RoaringBitmap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
 
@@ -54,6 +55,10 @@ pub enum BlockCompression {
 
 /// Series block magic bytes (v1 and v2).
 pub const SER_BLOCK_MAGIC: &[u8; 8] = b"UGNSER01";
+
+/// Tag block index magic (inverted index per block).
+pub(crate) const TAG_INDEX_MAGIC: &[u8; 8] = b"UGNTAGIX";
+const TAG_INDEX_VERSION: u32 = 4;
 
 const SER_BLOCK_V2: u32 = 2;
 const TS_CODEC_DELTA_VARINT: u8 = 1;
@@ -759,7 +764,6 @@ pub(crate) fn decode_series_block_v2_all_rows(
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn encode_series_block_v1(rows: &[Row]) -> Result<Vec<u8>, DbError> {
     let row_count = rows.len();
     if row_count == 0 {
@@ -861,7 +865,7 @@ fn write_var_u64(buf: &mut Vec<u8>, mut v: u64) {
     buf.push(v as u8);
 }
 
-fn write_var_u32(buf: &mut Vec<u8>, v: u32) {
+pub(crate) fn write_var_u32(buf: &mut Vec<u8>, v: u32) {
     write_var_u64(buf, v as u64);
 }
 
@@ -882,7 +886,7 @@ fn read_var_u64<R: Read>(r: &mut R) -> Result<u64, String> {
     Err("Varint too long".to_string())
 }
 
-fn read_var_u32<R: Read>(r: &mut R) -> Result<u32, String> {
+pub(crate) fn read_var_u32<R: Read>(r: &mut R) -> Result<u32, String> {
     let v = read_var_u64(r)?;
     if v > u32::MAX as u64 {
         return Err("Varint does not fit in u32".to_string());
@@ -1091,8 +1095,6 @@ fn decode_gorilla_xor_u64<R: Read>(r: &mut R, count: usize) -> Result<Vec<u64>, 
 }
 
 fn encode_tags_dictionary(rows: &[Row], out: &mut Vec<u8>) -> Result<(), DbError> {
-    use std::collections::BTreeSet;
-
     let mut uniq: BTreeSet<String> = BTreeSet::new();
     for r in rows {
         for (k, v) in &r.tags {
@@ -1156,6 +1158,504 @@ fn encode_tags_dictionary(rows: &[Row], out: &mut Vec<u8>) -> Result<(), DbError
     write_var_u32(out, tags_len_u32);
     out.extend_from_slice(&tags_blob);
     Ok(())
+}
+
+// --- Tag block index (inverted index: (key_id, value_id) -> row bitmap) ---
+
+/// Builds the same dictionary as `encode_tags_dictionary` (sorted order) and returns
+/// (dict, map from (k,v) string pair to (key_id, value_id)) for (k,v) that appear in rows.
+fn build_tag_dict(rows: &[Row]) -> (Vec<String>, HashMap<(String, String), (u32, u32)>) {
+    let mut uniq: BTreeSet<String> = BTreeSet::new();
+    for r in rows {
+        for (k, v) in &r.tags {
+            uniq.insert(k.clone());
+            uniq.insert(v.clone());
+        }
+    }
+    let dict: Vec<String> = uniq.into_iter().collect();
+    let str_to_id: HashMap<&str, u32> = dict
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i as u32))
+        .collect();
+    let mut kv_to_id: HashMap<(String, String), (u32, u32)> = HashMap::new();
+    for r in rows {
+        for (k, v) in &r.tags {
+            if let (Some(&kid), Some(&vid)) = (str_to_id.get(k.as_str()), str_to_id.get(v.as_str())) {
+                kv_to_id.insert((k.clone(), v.clone()), (kid, vid));
+            }
+        }
+    }
+    (dict, kv_to_id)
+}
+
+/// Builds a tag block index from rows.
+///
+/// Version 4 stores a classic inverted index `(key_id, value_id) -> set(row_idx)` as
+/// **Roaring compressed bitmaps**. This is the enterprise-standard approach for high-cardinality
+/// tag filtering because it supports fast AND intersections while remaining compact for both
+/// sparse and dense sets (the representation adapts internally).
+///
+/// Important: the index stores only `(kid,vid)` ids; it does **not** duplicate the tag dictionary
+/// strings already stored in the series block.
+pub(crate) fn build_tag_block_index(rows: &[Row]) -> Result<Vec<u8>, DbError> {
+    let row_count = rows.len();
+    if row_count == 0 {
+        return Err(DbError::Internal(
+            "Refusing to build tag index for empty block".to_string(),
+        ));
+    }
+    let (_dict, str_to_id) = build_tag_dict(rows);
+    // (kid, vid) -> roaring bitmap (row indices where this (k,v) appears)
+    let mut by_kv: BTreeMap<(u32, u32), RoaringBitmap> = BTreeMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        let i: u32 = i
+            .try_into()
+            .map_err(|_| DbError::Internal("Too many rows for tag index".to_string()))?;
+        for (k, v) in &r.tags {
+            if let Some(&(kid, vid)) = str_to_id.get(&(k.clone(), v.clone())) {
+                by_kv.entry((kid, vid)).or_default().insert(i);
+            }
+        }
+    }
+
+    // On-disk v4 encoding:
+    // magic(8) + version(u32) + row_count(var_u32) + entries(var_u32)
+    // raw_len(var_u32) + zstd_len(var_u32) + zstd(raw_payload) + crc32(u32)
+    //
+    // raw_payload layout:
+    //   [ kid(var_u32) vid(var_u32) bitmap_len(var_u32) bitmap_bytes ]
+    let mut out = Vec::new();
+    out.extend_from_slice(TAG_INDEX_MAGIC);
+    write_u32(&mut out, TAG_INDEX_VERSION);
+    write_var_u32(&mut out, row_count as u32);
+    write_var_u32(&mut out, by_kv.len() as u32);
+    let mut raw = Vec::new();
+    for ((kid, vid), bm) in &by_kv {
+        write_var_u32(&mut raw, *kid);
+        write_var_u32(&mut raw, *vid);
+        let mut bm_bytes = Vec::new();
+        bm.serialize_into(&mut bm_bytes)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let n: u32 = bm_bytes
+            .len()
+            .try_into()
+            .map_err(|_| DbError::Internal("Tag index bitmap too large".to_string()))?;
+        write_var_u32(&mut raw, n);
+        raw.extend_from_slice(&bm_bytes);
+    }
+
+    let raw_len: u32 = raw
+        .len()
+        .try_into()
+        .map_err(|_| DbError::Internal("Tag index payload too large".to_string()))?;
+    let zstd = zstd::stream::encode_all(std::io::Cursor::new(&raw), 3)
+        .map_err(|e| DbError::Io(e))?;
+    let zstd_len: u32 = zstd
+        .len()
+        .try_into()
+        .map_err(|_| DbError::Internal("Tag index compressed payload too large".to_string()))?;
+
+    write_var_u32(&mut out, raw_len);
+    write_var_u32(&mut out, zstd_len);
+    out.extend_from_slice(&zstd);
+
+    let crc = crc32(&out);
+    write_u32(&mut out, crc);
+    Ok(out)
+}
+
+/// Parsed tag block index for use in query path.
+pub(crate) enum TagBlockIndex {
+    /// Version 1: (kid,vid) -> bitmap(row_count bits).
+    BitmapV1 {
+        row_count: usize,
+        dict: Vec<String>,
+        bitmaps: HashMap<(u32, u32), Vec<u8>>,
+    },
+    /// Version 2: (kid,vid) -> postings (sorted row indices).
+    PostingsV2 {
+        row_count: usize,
+        dict: Vec<String>,
+        postings: HashMap<(u32, u32), Vec<u32>>,
+    },
+    /// Version 3: (kid,vid) -> roaring compressed bitmap(row indices).
+    RoaringV3 {
+        row_count: usize,
+        bitmaps: HashMap<(u32, u32), RoaringBitmap>,
+    },
+}
+
+pub(crate) enum TagIndexCandidates {
+    /// Filter is empty; treat as no tag filtering.
+    All,
+    /// Candidate bitmap (bit i => row i matches all filter terms).
+    Bitmap(Vec<u8>),
+    /// Candidate row indices that match all filter terms.
+    Rows(Vec<u32>),
+}
+
+impl TagBlockIndex {
+    /// Returns candidates for the filter (AND semantics).
+    ///
+    /// Returns `None` if no rows can match (missing dictionary term or missing posting/bitmap).
+    pub fn candidates_for_filter(&self, filter: &TagSet) -> Option<TagIndexCandidates> {
+        if filter.is_empty() {
+            return Some(TagIndexCandidates::All);
+        }
+        let (row_count, dict) = match self {
+            TagBlockIndex::RoaringV3 { .. } => return None,
+            TagBlockIndex::BitmapV1 { row_count, dict, .. } => (*row_count, dict),
+            TagBlockIndex::PostingsV2 { row_count, dict, .. } => (*row_count, dict),
+        };
+        let _ = row_count;
+
+        let mut map: HashMap<&str, u32> = HashMap::new();
+        for (i, s) in dict.iter().enumerate() {
+            map.insert(s.as_str(), i as u32);
+        }
+
+        match self {
+            TagBlockIndex::BitmapV1 { row_count, bitmaps, .. } => {
+                let bytes = (*row_count + 7) / 8;
+                let mut result: Option<Vec<u8>> = None;
+                for (k, v) in filter {
+                    let kid = *map.get(k.as_str())?;
+                    let vid = *map.get(v.as_str())?;
+                    let bm = bitmaps.get(&(kid, vid))?;
+                    result = Some(match result.take() {
+                        None => bm.clone(),
+                        Some(acc) => {
+                            debug_assert_eq!(acc.len(), bm.len());
+                            acc.iter()
+                                .zip(bm.iter())
+                                .map(|(a, b)| a & b)
+                                .collect()
+                        }
+                    });
+                }
+                // Defensive: ensure correct length.
+                result.filter(|bm| bm.len() == bytes).map(TagIndexCandidates::Bitmap)
+            }
+            TagBlockIndex::PostingsV2 { postings, .. } => {
+                let mut acc: Option<Vec<u32>> = None;
+                for (k, v) in filter {
+                    let kid = *map.get(k.as_str())?;
+                    let vid = *map.get(v.as_str())?;
+                    let p = postings.get(&(kid, vid))?;
+                    acc = Some(match acc.take() {
+                        None => p.clone(),
+                        Some(cur) => intersect_sorted_u32(&cur, p),
+                    });
+                    if let Some(ref a) = acc {
+                        if a.is_empty() {
+                            return None;
+                        }
+                    }
+                }
+                acc.map(TagIndexCandidates::Rows)
+            }
+            TagBlockIndex::RoaringV3 { .. } => None,
+        }
+    }
+
+    /// Preferred candidate computation for v3: use pre-resolved `(kid,vid)` pairs.
+    ///
+    /// Returns:
+    /// - `Some(bitmap)` if there are candidates (bitmap may be empty only when matcher is empty)
+    /// - `None` if any term is missing or intersection is empty.
+    pub fn candidates_for_matcher_v2(&self, matcher: &TagFilterMatcherV2) -> Option<RoaringBitmap> {
+        let TagBlockIndex::RoaringV3 { bitmaps, .. } = self else {
+            return None;
+        };
+        if matcher.pairs.is_empty() {
+            // Caller treats this as "no tag filtering". Keep explicit and cheap.
+            return Some(RoaringBitmap::new());
+        }
+        let mut it = matcher.pairs.iter().copied();
+        let first = it.next()?;
+        let mut acc = bitmaps.get(&first)?.clone();
+        for pair in it {
+            let bm = bitmaps.get(&pair)?;
+            acc &= bm;
+            if acc.is_empty() {
+                return None;
+            }
+        }
+        Some(acc)
+    }
+
+    /// Returns true if row index `i` is set in the bitmap.
+    #[inline]
+    pub fn bitmap_get(bitmap: &[u8], row_count: usize, i: usize) -> bool {
+        if i >= row_count {
+            return false;
+        }
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+        bitmap
+            .get(byte_idx)
+            .map_or(false, |b| (b & (1 << bit_idx)) != 0)
+    }
+}
+
+fn intersect_sorted_u32(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Parses a tag block index blob.
+pub(crate) fn parse_tag_block_index(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<TagBlockIndex, DbError> {
+    let mut cur = std::io::Cursor::new(bytes);
+    let mut magic = [0u8; 8];
+    cur.read_exact(&mut magic)?;
+    if &magic != TAG_INDEX_MAGIC {
+        return Err(DbError::Corruption {
+            details: format!("Bad tag index magic in {:?}", path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let version = read_u32(&mut cur)?;
+    if version != 1 && version != 2 && version != 3 && version != TAG_INDEX_VERSION {
+        return Err(DbError::Corruption {
+            details: format!("Unsupported tag index version {} in {:?}", version, path),
+            series: None,
+            timestamp: None,
+        });
+    }
+    let row_count = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+
+    if version == TAG_INDEX_VERSION {
+        // v4: roaring bitmaps in a zstd-compressed payload + trailing crc32, no embedded dictionary.
+        let num_entries = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let raw_len = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let zstd_len = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let mut zstd = vec![0u8; zstd_len];
+        cur.read_exact(&mut zstd)?;
+
+        let raw = zstd::stream::decode_all(std::io::Cursor::new(&zstd)).map_err(DbError::Io)?;
+        if raw.len() != raw_len {
+            return Err(DbError::Corruption {
+                details: format!("Tag index payload length mismatch in {:?}", path),
+                series: None,
+                timestamp: None,
+            });
+        }
+
+        let mut payload = std::io::Cursor::new(&raw);
+        let mut bitmaps: HashMap<(u32, u32), RoaringBitmap> = HashMap::with_capacity(num_entries);
+        for _ in 0..num_entries {
+            let kid = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let vid = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let n = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })? as usize;
+            let mut bm_bytes = vec![0u8; n];
+            payload.read_exact(&mut bm_bytes)?;
+            let mut rdr = std::io::Cursor::new(&bm_bytes);
+            let bm = RoaringBitmap::deserialize_from(&mut rdr)
+                .map_err(|e| DbError::Serialization(e.to_string()))?;
+            bitmaps.insert((kid, vid), bm);
+        }
+        // trailing crc32
+        let expected_crc = read_u32(&mut cur)?;
+        if bytes.len() < 4 {
+            return Err(DbError::Corruption {
+                details: format!("Truncated tag index in {:?}", path),
+                series: None,
+                timestamp: None,
+            });
+        }
+        let actual_crc = crc32(&bytes[..bytes.len() - 4]);
+        if expected_crc != actual_crc {
+            return Err(DbError::Corruption {
+                details: format!("Tag index CRC mismatch in {:?}", path),
+                series: None,
+                timestamp: None,
+            });
+        }
+        return Ok(TagBlockIndex::RoaringV3 { row_count, bitmaps });
+    }
+
+    if version == 3 {
+        // v3: roaring bitmaps without compression + trailing crc32, no embedded dictionary.
+        let num_entries = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let mut bitmaps: HashMap<(u32, u32), RoaringBitmap> = HashMap::with_capacity(num_entries);
+        for _ in 0..num_entries {
+            let kid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let vid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let n = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })? as usize;
+            let mut bm_bytes = vec![0u8; n];
+            cur.read_exact(&mut bm_bytes)?;
+            let mut rdr = std::io::Cursor::new(&bm_bytes);
+            let bm = RoaringBitmap::deserialize_from(&mut rdr)
+                .map_err(|e| DbError::Serialization(e.to_string()))?;
+            bitmaps.insert((kid, vid), bm);
+        }
+        let expected_crc = read_u32(&mut cur)?;
+        if bytes.len() < 4 {
+            return Err(DbError::Corruption {
+                details: format!("Truncated tag index in {:?}", path),
+                series: None,
+                timestamp: None,
+            });
+        }
+        let actual_crc = crc32(&bytes[..bytes.len() - 4]);
+        if expected_crc != actual_crc {
+            return Err(DbError::Corruption {
+                details: format!("Tag index CRC mismatch in {:?}", path),
+                series: None,
+                timestamp: None,
+            });
+        }
+        return Ok(TagBlockIndex::RoaringV3 { row_count, bitmaps });
+    }
+
+    let dict_count = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    let mut dict = Vec::with_capacity(dict_count);
+    for _ in 0..dict_count {
+        let n = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+            details: d,
+            series: None,
+            timestamp: None,
+        })? as usize;
+        let mut b = vec![0u8; n];
+        cur.read_exact(&mut b)?;
+        dict.push(String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?);
+    }
+    let num_entries = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+        details: d,
+        series: None,
+        timestamp: None,
+    })? as usize;
+    if version == 1 {
+        // Bitmap of row_count bits = ceil(row_count/8) bytes.
+        let bitmap_bytes = (row_count + 7) / 8;
+        let mut bitmaps = HashMap::new();
+        for _ in 0..num_entries {
+            let kid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let vid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let mut bm = vec![0u8; bitmap_bytes];
+            cur.read_exact(&mut bm)?;
+            bitmaps.insert((kid, vid), bm);
+        }
+        Ok(TagBlockIndex::BitmapV1 {
+            row_count,
+            dict,
+            bitmaps,
+        })
+    } else {
+        let mut postings: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        for _ in 0..num_entries {
+            let kid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let vid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })?;
+            let n = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                details: d,
+                series: None,
+                timestamp: None,
+            })? as usize;
+            let mut out = Vec::with_capacity(n);
+            let mut cur_idx = 0u32;
+            for j in 0..n {
+                let v = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
+                    details: d,
+                    series: None,
+                    timestamp: None,
+                })?;
+                if j == 0 {
+                    cur_idx = v;
+                } else {
+                    cur_idx = cur_idx.saturating_add(v);
+                }
+                out.push(cur_idx);
+            }
+            postings.insert((kid, vid), out);
+        }
+        Ok(TagBlockIndex::PostingsV2 {
+            row_count,
+            dict,
+            postings,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1231,6 +1731,33 @@ mod encoding_compression_acceptance_tests {
                 );
             }
             other => panic!("expected corruption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v1_block_encode_decode_roundtrip_is_stable() {
+        let rows = make_rows();
+        let bytes = encode_series_block_v1(&rows).expect("v1 encode");
+        let path = Path::new("v1_roundtrip_test");
+
+        let decoded = decode_series_block_v1_all_rows(&bytes, path).expect("v1 decode all rows");
+        assert_eq!(decoded.len(), rows.len());
+
+        for (a, b) in decoded.iter().zip(rows.iter()) {
+            assert_eq!(a.seq, b.seq);
+            assert_eq!(a.timestamp, b.timestamp);
+            assert!(a.value.to_bits() == b.value.to_bits(), "value must be bit-exact");
+            assert_eq!(a.tags, b.tags);
+        }
+
+        // Also validate the query-path decoder + tag matching logic is coherent for v1 blocks.
+        let q = decode_series_block_v1_for_query(&bytes, path).expect("v1 decode for query");
+        let mut filter = TagSet::new();
+        filter.insert("host".to_string(), "a".to_string());
+        for i in 0..rows.len() {
+            let expected = check_tags(&rows[i].tags, &filter);
+            let got = q.row_matches_filter_v1(i, &filter).expect("tag match");
+            assert_eq!(got, expected, "row_matches_filter_v1 mismatch at i={}", i);
         }
     }
 }

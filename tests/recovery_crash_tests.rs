@@ -6,6 +6,8 @@ use tempfile::tempdir;
 
 use ugnos::{DbConfig, DbCore, DbError, Snapshotter, TagSet, WriteAheadLog};
 
+mod test_manifest;
+
 #[test]
 fn test_recovery_after_crash_wal_append() {
     // Simulate "crash after WAL append": WAL contains inserts, nothing else is durable.
@@ -36,8 +38,11 @@ fn test_recovery_after_crash_wal_append() {
     let mut db = DbCore::with_config(cfg).unwrap();
     db.recover().unwrap();
 
-    let mut r = db.query("series_a", 0..u64::MAX, None).unwrap();
-    r.sort_by(|a, b| a.0.cmp(&b.0));
+    let r = db.query("series_a", 0..u64::MAX, None).unwrap();
+    assert!(
+        r.windows(2).all(|w| w[1].0 >= w[0].0),
+        "query must return points in timestamp order"
+    );
     assert_eq!(r, vec![(10, 1.25), (11, 2.25)]);
 }
 
@@ -71,8 +76,21 @@ fn test_recovery_after_crash_during_flush_wal_rotated_segments_enabled() {
     let mut db = DbCore::with_config(cfg.clone()).unwrap();
     db.recover().unwrap();
 
-    let mut r = db.query("series_b", 0..u64::MAX, None).unwrap();
-    r.sort_by(|a, b| a.0.cmp(&b.0));
+    // Make the ordering assertion airtight: this scenario should materialize exactly one segment,
+    // so the query is effectively single-segment (global ordering across multiple segments is not
+    // guaranteed per the project contract).
+    let m = test_manifest::read_manifest(&cfg.data_dir);
+    assert_eq!(
+        m.segments.len(),
+        1,
+        "expected exactly one segment after recovery; if this becomes multi-segment, do not assume query order"
+    );
+
+    let r = db.query("series_b", 0..u64::MAX, None).unwrap();
+    assert!(
+        r.windows(2).all(|w| w[1].0 >= w[0].0),
+        "query must return points in timestamp order"
+    );
     assert_eq!(r, vec![(100, 10.0), (101, 11.0)]);
 
     // WAL should be truncated to header after recovery (bounded restart cost).
@@ -122,8 +140,11 @@ fn test_recovery_after_crash_during_snapshot_write_tmp_is_ignored() {
     let mut db = DbCore::with_config(cfg).unwrap();
     db.recover().unwrap();
 
-    let mut r = db.query("series_s", 0..u64::MAX, None).unwrap();
-    r.sort_by(|a, b| a.0.cmp(&b.0));
+    let r = db.query("series_s", 0..u64::MAX, None).unwrap();
+    assert!(
+        r.windows(2).all(|w| w[1].0 >= w[0].0),
+        "query must return points in timestamp order"
+    );
     assert_eq!(r, vec![(1, 1.0), (2, 2.0)]);
 }
 

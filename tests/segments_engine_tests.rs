@@ -22,13 +22,14 @@ fn make_segments_config(dir: &Path) -> DbConfig {
 }
 
 fn sort_results(v: &mut Vec<(Timestamp, Value)>) {
+    // Project contract (README): query results are not guaranteed globally sorted across segments.
+    // Tests that compare query outputs across compaction/recovery should normalize order.
     v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
 }
 
 // --- test-only manifest reader (black-box, validates CRC) ---
 
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct TestManifest {
     version: u32,
     next_segment_id: u64,
@@ -37,7 +38,6 @@ struct TestManifest {
 }
 
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct TestSegmentRecord {
     id: u64,
     level: u8,
@@ -47,10 +47,13 @@ struct TestSegmentRecord {
     max_ts: u64,
     file_name: String,
     series: std::collections::BTreeMap<String, TestSeriesBlockMeta>,
+    #[serde(default)]
+    tag_postings_offset: u64,
+    #[serde(default)]
+    tag_postings_len: u32,
 }
 
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct TestSeriesBlockMeta {
     offset: u64,
     len: u64,
@@ -58,6 +61,68 @@ struct TestSeriesBlockMeta {
     min_ts: u64,
     max_ts: u64,
     crc32: u32,
+    #[serde(default)]
+    tag_index_offset: u64,
+    #[serde(default)]
+    tag_index_len: u32,
+}
+
+fn assert_manifest_invariants(m: &TestManifest) {
+    assert_eq!(m.version, 1, "manifest version mismatch");
+    assert!(
+        !m.segments.is_empty(),
+        "expected manifest to contain at least one segment"
+    );
+    if let Some(db) = m.delete_before {
+        assert!(db > 0, "delete_before must be > 0 when present");
+    }
+
+    let max_id = m.segments.iter().map(|s| s.id).max().unwrap_or(0);
+    assert!(
+        m.next_segment_id >= max_id.saturating_add(1),
+        "next_segment_id must be >= max(segment_id)+1 (max_id={}, next={})",
+        max_id,
+        m.next_segment_id
+    );
+
+    for s in &m.segments {
+        assert!(s.id > 0, "segment id must be > 0");
+        assert!(!s.file_name.is_empty(), "segment file_name must be non-empty");
+        assert!(
+            s.level <= 1,
+            "segment level must be 0 or 1 in tests (got {})",
+            s.level
+        );
+        assert!(s.created_at > 0, "segment created_at must be > 0");
+        assert!(s.max_seq > 0, "segment max_seq must be > 0");
+        assert!(s.min_ts <= s.max_ts, "segment min_ts must be <= max_ts");
+
+        // Postings index fields should be consistent (both present or both absent).
+        assert!(
+            (s.tag_postings_offset == 0 && s.tag_postings_len == 0)
+                || (s.tag_postings_offset > 0 && s.tag_postings_len > 0),
+            "tag postings offset/len must be both zero or both non-zero (off={}, len={})",
+            s.tag_postings_offset,
+            s.tag_postings_len
+        );
+
+        // Series block metadata should be self-consistent.
+        for (name, meta) in &s.series {
+            assert!(!name.is_empty(), "series name must be non-empty");
+            assert!(meta.offset > 0, "series block offset must be > 0");
+            assert!(meta.len > 0, "series block len must be > 0");
+            assert!(meta.row_count > 0, "series block row_count must be > 0");
+            assert!(meta.min_ts <= meta.max_ts, "series meta min_ts <= max_ts");
+            assert!(meta.crc32 != 0, "series block crc32 must be non-zero");
+            assert!(
+                (meta.tag_index_offset == 0 && meta.tag_index_len == 0)
+                    || (meta.tag_index_offset > 0 && meta.tag_index_len > 0),
+                "tag index offset/len must be both zero or both non-zero (off={}, len={})",
+                meta.tag_index_offset,
+                meta.tag_index_len
+            );
+        }
+    }
 }
 
 fn read_manifest(dir: &Path) -> TestManifest {
@@ -85,7 +150,9 @@ fn read_manifest(dir: &Path) -> TestManifest {
     hasher.update(&payload);
     let actual_crc = hasher.finalize();
     assert_eq!(actual_crc, expected_crc, "manifest CRC mismatch");
-    bincode::deserialize::<TestManifest>(&payload).unwrap()
+    let m = bincode::deserialize::<TestManifest>(&payload).unwrap();
+    assert_manifest_invariants(&m);
+    m
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) {
@@ -108,6 +175,12 @@ proptest! {
 
     #[test]
     fn prop_compaction_preserves_query_results(
+        // Generate a proptest strategy that produces a vector of 1 to 199 tuples.
+        // Each tuple contains:
+        //  - a u8 value in the range 0..3 (i.e., 0, 1, or 2),
+        //  - a u64 timestamp in the range 0..9_999,
+        //  - and a random normal (non-NaN, non-infinite) f64 value (prop::num::f64::NORMAL).
+        // The vector simulates a randomized batch of (series_id, timestamp, value) operations
         ops in prop::collection::vec((0u8..3, 0u64..10_000, prop::num::f64::NORMAL), 1..200)
     ) {
         let dir = tempdir().unwrap();

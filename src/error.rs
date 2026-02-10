@@ -37,6 +37,19 @@ pub enum DbError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Series cardinality limit exceeded for the given scope (tenant/namespace).
+    #[error(
+        "Series cardinality limit exceeded: current={current}, limit={limit}, scope={scope}"
+    )]
+    SeriesCardinalityLimitExceeded {
+        /// Current cardinality (distinct series keys) in the scope.
+        current: u64,
+        /// Configured hard limit.
+        limit: u64,
+        /// Scope identifier (e.g. tenant or "default").
+        scope: String,
+    },
 }
 
 // Implement conversion from lock poison errors for convenience

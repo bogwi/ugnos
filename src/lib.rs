@@ -12,6 +12,7 @@ pub mod storage;
 pub mod telemetry;
 pub mod types;
 pub mod utils;
+mod cardinality_store;
 
 /// Configuration options for the database core.
 pub use crate::core::DbConfig;
