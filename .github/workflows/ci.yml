@@ -1,8 +1,16 @@
 name: CI
 
+# Run on branch pushes and PRs only; exclude tag pushes (tagged commits are already green).
+# Per GitHub docs: when using tags-ignore we must explicitly specify branches to trigger on.
 on:
   push:
+    tags-ignore:
+      - '**'
+    branches:
+      - '**'
   pull_request:
+    branches:
+      - '**'
 
 jobs:
   test:

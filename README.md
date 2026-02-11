@@ -4,6 +4,8 @@
 
 For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md).
 
+For latest changelog, see the [CHANGELOG](CHANGELOG.md). README may lag behind.
+
 ## What this is / what this is not (yet)
 
 This crate is a **library-grade database core** intended to be embedded into a Rust process (service/agent/daemon).
@@ -74,6 +76,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 use ugnos::{DbConfig, DbCore};
 
+use ugnos::encoding::{
+  BlockCompression::Zstd, 
+  FloatEncoding::GorillaXor,
+};
+
 let dir = TempDir::new().unwrap();
 let mut cfg = DbConfig::default();
 cfg.data_dir = PathBuf::from(dir.path());
@@ -88,16 +95,24 @@ cfg.wal_buffer_size = 1_000;
 cfg.flush_interval = Duration::from_millis(250);
 cfg.snapshot_interval = Duration::from_secs(60 * 15);
 
-// Retention (optional): makes data older than now - ttl invisible, and compaction reclaims disk.
+// Retention (optional): 
+// makes data older than now - ttl invisible, 
+// and compaction reclaims disk.
 cfg.retention_ttl = Some(Duration::from_secs(60 * 60 * 24 * 7));
 cfg.retention_check_interval = Duration::from_secs(1);
 
-// Encoding & compression (series blocks in segments): float (Raw64 | GorillaXor), tag dictionary, LZ4/Zstd.
-cfg.segment_store.encoding.float_encoding = ugnos::encoding::FloatEncoding::GorillaXor;
-cfg.segment_store.encoding.compression = ugnos::encoding::BlockCompression::Zstd { level: 3 };
+// Encoding & compression (series blocks in segments): 
+// float (Raw64 | GorillaXor), tag dictionary, LZ4/Zstd.
+cfg.segment_store.encoding.float_encoding = GorillaXor;
+cfg.segment_store.encoding.compression = Zstd { level: 3 };
 
-// Cardinality (optional): hard limit for distinct series per scope; scope from tags[cardinality_scope_tag_key].
-// When exceeded, insert returns DbError::SeriesCardinalityLimitExceeded and metrics (ugnos_cardinality_limit_rejections, ugnos_series_cardinality).
+// Cardinality (optional): 
+// hard limit for distinct series per scope; 
+// scope is derived from tags[cardinality_scope_tag_key].
+// When exceeded, insert returns DbError::SeriesCardinalityLimitExceeded 
+// and metrics:
+// - ugnos_cardinality_limit_rejections
+// - ugnos_series_cardinality
 // cfg.max_series_cardinality = Some(100);
 // cfg.cardinality_scope_tag_key = Some("tenant".to_string());
 
@@ -151,7 +166,9 @@ fn main() -> Result<(), ugnos::DbError> {
     cfg.enable_wal = true;
     cfg.enable_snapshots = true;
     cfg.enable_segments = true;
-    cfg.retention_ttl = Some(Duration::from_secs(60 * 60 * 24 * 30));
+    cfg.retention_ttl = Some(
+      Duration::from_secs(60 * 60 * 24 * 30) // 30 days
+    );
     cfg.event_listener = Arc::new(MemoryEvents(events.clone()));
 
     let mut db = DbCore::with_config(cfg)?;
@@ -165,7 +182,8 @@ fn main() -> Result<(), ugnos::DbError> {
     db.insert("cpu_usage", 200, 0.80, tags.clone())?;
     db.flush()?; // blocks until durable
 
-    let mut results = db.query("cpu_usage", 0..u64::MAX, Some(&tags))?;
+    let mut results = db.query(
+      "cpu_usage", 0..u64::MAX, Some(&tags))?;
     results.sort_by_key(|(ts, _)| *ts);
     assert_eq!(results.len(), 2);
 
@@ -174,8 +192,6 @@ fn main() -> Result<(), ugnos::DbError> {
 ```
 
 ## How to build and test (this workspace)
-
-This repo is a Rust workspace. From the workspace root (the `papers/` folder):
 
 ```bash
 cargo build --release -p ugnos
