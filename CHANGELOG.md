@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README "Deployment recipes", `deploy/systemd/ugnosd.service`, `deploy/k8s/*.yaml` 
 - `tests/daemon_health_tests.rs`: `graceful_shutdown_prints_flush_and_complete` (exit 0 on Unix), `graceful_shutdown_then_restart_recovery_succeeds`; daemon calls `db.flush()` then `drop(db)`. 
 
+### Changed
+- Change in `src/core.rs`: The whole cardinality block (scope, register_and_was_new, append_scope_key, record_series_cardinality) runs only when `self.config.max_series_cardinality.is_some()`. When it’s `None`, that block is skipped.
+
 ## [Released]
 
 ### [0.4.1] - 2026-02-11

@@ -49,16 +49,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Install iai-callgrind-runner (for iai-callgrind microbench suite)
         run: cargo install --locked --version 0.16.1 iai-callgrind-runner
+      # On main: run benchmarks and save as baseline. On other branches: run benchmarks
+      # and compare to cached baseline. Do NOT use --load-baseline on branches: that
+      # makes the runner skip execution and use the cached data as "current" (see dev/MICROBENCH_IAI_CI.md).
       - name: Run deterministic microbench suite (iai-callgrind)
         run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             cargo bench --bench microbench_iai -- --save-baseline=default
           elif [ "${{ steps.restore-iai.outputs.cache-hit }}" = "true" ]; then
-            cargo bench --bench microbench_iai -- --baseline=default --load-baseline=default
+            cargo bench --bench microbench_iai -- --baseline=default
           else
             echo "::warning::No cached baseline (new repo or cache evicted); running with --save-baseline (no comparison). Push to main to establish baseline."
             cargo bench --bench microbench_iai -- --save-baseline=default
           fi
+      # Can fail with "another job may be creating this cache" if multiple main runs race; see dev/MICROBENCH_IAI_CI.md.
       - name: Save iai-callgrind baseline (main only, on success)
         if: success() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4

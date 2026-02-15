@@ -764,33 +764,36 @@ impl DbCore {
             tags: tags.clone(),
         };
 
-        // Enforce series cardinality limit before WAL and buffer (per-scope).
-        let scope = self
-            .config
-            .cardinality_scope_tag_key
-            .as_deref()
-            .and_then(|k| tags.get(k))
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
+        // Only track cardinality and enforce limits when a limit is configured.
+        // When max_series_cardinality is None, skip scope derivation, HashSet lookup/insert,
+        // and cardinality metrics to avoid hot-path cost for users who do not use limits.
+        if self.config.max_series_cardinality.is_some() {
+            let scope = self
+                .config
+                .cardinality_scope_tag_key
+                .as_deref()
+                .and_then(|k| tags.get(k))
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
 
-        let was_new = match self.cardinality.register_and_was_new(scope, series, &tags) {
-            Ok(was_new) => was_new,
-            Err(e) => {
-                db_metrics::record_cardinality_limit_rejected(scope);
-                return Err(e);
-            }
-        };
+            let was_new = match self.cardinality.register_and_was_new(scope, series, &tags) {
+                Ok(was_new) => was_new,
+                Err(e) => {
+                    db_metrics::record_cardinality_limit_rejected(scope);
+                    return Err(e);
+                }
+            };
 
-        // Persist newly observed keys (fail-closed if durability cannot be guaranteed).
-        if was_new {
-            if let Some(store) = &self.cardinality_store {
-                let key = SeriesKey::new(series, &tags);
-                store.append_scope_key(scope, &key)?;
+            if was_new {
+                if let Some(store) = &self.cardinality_store {
+                    let key = SeriesKey::new(series, &tags);
+                    store.append_scope_key(scope, &key)?;
+                }
             }
+
+            db_metrics::record_series_cardinality(scope, self.cardinality.current_count(scope));
         }
-
-        db_metrics::record_series_cardinality(scope, self.cardinality.current_count(scope));
 
         // Log to WAL if enabled
         if let Some(wal) = &self.wal {
