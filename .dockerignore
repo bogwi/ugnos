@@ -1,0 +1,29 @@
+# Build artifacts and local state (keep build context small; avoid invalidating cache with local target)
+/target
+/data
+*.log
+
+# Development and docs (not needed to build ugnosd)
+/dev
+*.md
+!README.md
+
+# Git and IDE
+.git
+.gitignore
+.cursor
+.vscode
+*.swp
+*~
+
+# Docker (avoid recursive copy)
+Dockerfile
+.dockerignore
+docker-compose*.yml
+*.dockerfile
+
+# Tests and benches source are not required for the binary; Cargo.toml references them so we include.
+# Exclude only if we did a minimal COPY in Dockerfile; with COPY . . we keep them for cargo build.
+
+# Local config (evaluate with compose or env; do not bake into image)
+ugnosd.toml

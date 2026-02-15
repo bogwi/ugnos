@@ -1,0 +1,29 @@
+# Quickstart for local evaluation of ugnosd.
+# From ugnos project root: docker compose up -d && curl -s http://localhost:8080/healthz
+# Stop with graceful shutdown: docker compose down (SIGTERM → WAL flush, then stop).
+
+services:
+  ugnosd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ugnosd:local
+    container_name: ugnosd
+    ports:
+      - "8080:8080"
+    environment:
+      UGNOS_HTTP_BIND: "0.0.0.0:8080"
+      UGNOS_DATA_DIR: "/var/lib/ugnos"
+    volumes:
+      - ugnos_data:/var/lib/ugnos
+    # Allow daemon up to 30s to drain connections and flush WAL; Docker default 10s may SIGKILL before flush.
+    stop_grace_period: 35s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ugnos_data:

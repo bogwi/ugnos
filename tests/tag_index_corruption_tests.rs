@@ -61,7 +61,10 @@ fn assert_manifest_invariants(m: &TestManifest) {
 
     for s in &m.segments {
         assert!(s.id > 0, "segment id must be > 0");
-        assert!(!s.file_name.is_empty(), "segment file_name must be non-empty");
+        assert!(
+            !s.file_name.is_empty(),
+            "segment file_name must be non-empty"
+        );
         assert!(s.created_at > 0, "segment created_at must be > 0");
         assert!(s.max_seq > 0, "segment max_seq must be > 0");
         assert!(s.min_ts <= s.max_ts, "segment min_ts must be <= max_ts");
@@ -99,7 +102,10 @@ fn read_manifest(data_dir: &Path) -> TestManifest {
     use std::io::Read;
 
     // `SegmentStore::open` stores manifest under `data_dir/engine/segments/MANIFEST.bin`
-    let manifest_path = data_dir.join("engine").join("segments").join("MANIFEST.bin");
+    let manifest_path = data_dir
+        .join("engine")
+        .join("segments")
+        .join("MANIFEST.bin");
     let mut f = File::open(&manifest_path).expect("manifest exists");
 
     let mut magic = [0u8; 8];
@@ -138,10 +144,7 @@ fn tags(pairs: &[(&str, &str)]) -> TagSet {
 }
 
 fn segment_path(data_dir: &Path, file_name: &str) -> PathBuf {
-    data_dir
-        .join("engine")
-        .join("segments")
-        .join(file_name)
+    data_dir.join("engine").join("segments").join(file_name)
 }
 
 /// Adversarial test: prove the query path *consults* the on-disk per-block tag index and fails fast
@@ -180,10 +183,7 @@ fn breakit_corrupt_tag_index_is_detected_and_query_errors() {
         .max_by_key(|s| s.id)
         .expect("segment record");
 
-    let meta = seg
-        .series
-        .get("m")
-        .expect("series meta for m exists");
+    let meta = seg.series.get("m").expect("series meta for m exists");
 
     assert!(
         meta.tag_index_len > 0 && meta.tag_index_offset > 0,
@@ -211,4 +211,3 @@ fn breakit_corrupt_tag_index_is_detected_and_query_errors() {
         "expected corruption error after tag index corruption; got: {r:?}"
     );
 }
-

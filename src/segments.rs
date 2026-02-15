@@ -1,8 +1,8 @@
 use crate::encoding::{
-    build_tag_block_index, crc32, decode_series_block_v1_all_rows, decode_series_block_v1_for_query,
-    decode_series_block_v2_all_rows, decode_series_block_v2_for_query, encode_series_block,
-    parse_tag_block_index, read_u32, read_u64, read_var_u32, write_u32, write_u64, write_var_u32,
-    SegmentEncodingConfig,
+    build_tag_block_index, crc32, decode_series_block_v1_all_rows,
+    decode_series_block_v1_for_query, decode_series_block_v2_all_rows,
+    decode_series_block_v2_for_query, encode_series_block, parse_tag_block_index, read_u32,
+    read_u64, read_var_u32, write_u32, write_u64, write_var_u32, SegmentEncodingConfig,
     TagBlockIndex,
 };
 use crate::error::DbError;
@@ -443,11 +443,10 @@ impl SegmentStore {
             // entirely when we can prove no rows in this series block can match the tag filter.
             if let Some(filter) = tag_filter {
                 if seg.rec.tag_postings_len > 0 {
-                    let ord = seg
-                        .series_ord
-                        .get(series)
-                        .copied()
-                        .ok_or_else(|| DbError::Internal("Missing series ordinal".to_string()))?;
+                    let ord =
+                        seg.series_ord.get(series).copied().ok_or_else(|| {
+                            DbError::Internal("Missing series ordinal".to_string())
+                        })?;
                     if !seg.postings_might_match(ord, filter)? {
                         crate::telemetry::db_metrics::record_tag_postings_segment_skip();
                         continue;
@@ -517,8 +516,7 @@ fn compaction_loop(
         match rx.recv_timeout(timeout) {
             Ok(CompactionCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(CompactionCmd::Force { ack }) => {
-                let res =
-                    compact_l0_once(&state, segments_dir, tmp_dir, manifest_path, &cfg);
+                let res = compact_l0_once(&state, segments_dir, tmp_dir, manifest_path, &cfg);
                 let _ = ack.send(res);
             }
             Ok(CompactionCmd::Maybe) | Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1106,8 +1104,12 @@ fn build_segment_postings_index(
         let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for r in rows {
             for (k, v) in &r.tags {
-                let Some(&kid) = str_to_id.get(k) else { continue };
-                let Some(&vid) = str_to_id.get(v) else { continue };
+                let Some(&kid) = str_to_id.get(k) else {
+                    continue;
+                };
+                let Some(&vid) = str_to_id.get(v) else {
+                    continue;
+                };
                 seen.insert((kid, vid));
             }
         }
@@ -1166,7 +1168,10 @@ fn build_segment_postings_index(
     Ok(out)
 }
 
-fn parse_segment_postings_index(bytes: &[u8], path: &Path) -> Result<SegmentTagPostingsIndex, DbError> {
+fn parse_segment_postings_index(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<SegmentTagPostingsIndex, DbError> {
     if bytes.len() < 8 + 4 + 4 {
         return Err(DbError::Corruption {
             details: format!("Truncated postings index in {:?}", path),
@@ -1187,7 +1192,10 @@ fn parse_segment_postings_index(bytes: &[u8], path: &Path) -> Result<SegmentTagP
     let version = read_u32(&mut cur)?;
     if version != SEG_POSTINGS_VERSION {
         return Err(DbError::Corruption {
-            details: format!("Unsupported postings index version {} in {:?}", version, path),
+            details: format!(
+                "Unsupported postings index version {} in {:?}",
+                version, path
+            ),
             series: None,
             timestamp: None,
         });
@@ -1249,7 +1257,8 @@ fn parse_segment_postings_index(bytes: &[u8], path: &Path) -> Result<SegmentTagP
         })? as usize;
         let mut b = vec![0u8; n];
         payload.read_exact(&mut b)?;
-        let s = String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?;
+        let s =
+            String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?;
         str_to_id.insert(s, i as u32);
     }
     let entry_count = read_var_u32(&mut payload).map_err(|d| DbError::Corruption {
@@ -1565,23 +1574,24 @@ fn load_segment_index(path: &Path) -> Result<BTreeMap<String, SeriesBlockMeta>, 
     f.seek(SeekFrom::Start(index_offset))?;
     let mut index_bytes = vec![0u8; index_len as usize];
     f.read_exact(&mut index_bytes)?;
-    let (series_count, has_tag_index) = if index_bytes.len() >= 5 && index_bytes[0] == INDEX_VERSION_TAG_INDEX {
-        let count = u32::from_le_bytes([
-            index_bytes[1],
-            index_bytes[2],
-            index_bytes[3],
-            index_bytes[4],
-        ]) as usize;
-        (count, true)
-    } else {
-        let count = u32::from_le_bytes([
-            index_bytes[0],
-            index_bytes[1],
-            index_bytes[2],
-            index_bytes[3],
-        ]) as usize;
-        (count, false)
-    };
+    let (series_count, has_tag_index) =
+        if index_bytes.len() >= 5 && index_bytes[0] == INDEX_VERSION_TAG_INDEX {
+            let count = u32::from_le_bytes([
+                index_bytes[1],
+                index_bytes[2],
+                index_bytes[3],
+                index_bytes[4],
+            ]) as usize;
+            (count, true)
+        } else {
+            let count = u32::from_le_bytes([
+                index_bytes[0],
+                index_bytes[1],
+                index_bytes[2],
+                index_bytes[3],
+            ]) as usize;
+            (count, false)
+        };
     let mut cur = std::io::Cursor::new(index_bytes);
     if has_tag_index {
         cur.set_position(5);

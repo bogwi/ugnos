@@ -191,11 +191,142 @@ fn main() -> Result<(), ugnos::DbError> {
 }
 ```
 
-## How to build and test (this workspace)
+## Daemon (ugnosd)
+
+The `ugnosd` binary runs UGNOS as a production daemon. Configuration is layered (later overrides earlier):
+
+1. **Defaults** — built-in `DbConfig` defaults  
+2. **Config file** — TOML at `--config <path>` or, if omitted, `ugnosd.toml` in the current directory (if present)  
+3. **Environment** — `UGNOS_*` variables (e.g. `UGNOS_DATA_DIR`, `UGNOS_HTTP_BIND`, `UGNOS_SEGMENT_STORE__COMPACTION_CHECK_INTERVAL_SECS`; use `__` for nested keys)  
+4. **CLI** — `--config`, `--data-dir`, `--http-bind`, `--no-config`, `--validate-config`
+
+**Safe startup:** Before opening the database, the daemon checks that `data_dir` exists (creates it if missing) and is writable. If config is invalid, the data directory is unusable, or recovery fails, the process exits with a non-zero status and an error message.
+
+**Health endpoints (HTTP):** The daemon serves ops endpoints on the address given by `http_bind` (default `127.0.0.1:8080`; use `0.0.0.0:8080` for Docker/Kubernetes):
+
+- **`GET /healthz`** — liveness: returns 200 when the process is alive and responding.
+- **`GET /readyz`** — readiness: returns 200 after the database has been opened and recovery has completed; returns 503 otherwise.
+
+**Graceful shutdown:** On SIGINT (Ctrl+C) or SIGTERM, the daemon stops accepting new HTTP connections, waits for in-flight requests to finish (up to 30s), flushes the database buffer, then sends shutdown to the background flush thread (which performs a final flush and closes the WAL). The segment store’s compaction loop is stopped when the process exits. This guarantees WAL flush and a clean compaction stop as per the acceptance criteria.
+
+Example:
 
 ```bash
-cargo build --release -p ugnos
-cargo test --release -p ugnos
+cargo build --release
+./target/release/ugnosd --data-dir /var/lib/ugnos
+# Bind health server to all interfaces (e.g. for containers):
+./target/release/ugnosd --data-dir /var/lib/ugnos --http-bind 0.0.0.0:8080
+# Or validate config without starting the DB:
+./target/release/ugnosd --validate-config --config /etc/ugnosd.toml
+```
+
+See `ugnosd.toml.example` for a full TOML template.
+
+### Deployment recipes (single artifact per platform)
+
+The build produces a **single static-ish binary per platform** (no separate runtime or config artifacts required):
+
+```bash
+cargo build --release --bin ugnosd
+# Artifact: target/release/ugnosd
+```
+
+- **systemd:** Copy `deploy/systemd/ugnosd.service` to `/etc/systemd/system/`, create user `ugnos`, install the binary to `/usr/local/bin/ugnosd`, set `data_dir` (e.g. `/var/lib/ugnos`) and optionally `--config /etc/ugnosd.toml`. Then `systemctl daemon-reload && systemctl enable --now ugnosd`. Use `TimeoutStopSec=35` so SIGTERM allows WAL flush before kill.
+- **Docker:** See [Docker](#docker) below; image runs `ugnosd` as PID 1 with config and env overrides.
+- **Kubernetes:** Use the manifests under `deploy/k8s/` (Deployment, Service, optional ConfigMap). Set `livenessProbe` to `GET /healthz` and `readinessProbe` to `GET /readyz` on port 8080; give the pod a `terminationGracePeriodSeconds` of at least 35 so graceful shutdown can flush WAL.
+
+## Docker
+
+Build and run `ugnosd` in a container for local evaluation or deployment. The image runs as a non-root user, exposes port 8080 for `/healthz` and `/readyz`, and uses exec-form entrypoint so the daemon is PID 1 and receives SIGTERM for graceful shutdown (WAL flush, compaction stop).
+
+### Build
+
+From the **ugnos** project root:
+
+```bash
+docker build -t ugnosd:latest .
+```
+
+The image uses Rust 1.93 by default (edition 2024 requires 1.85+). To pin a different version:
+
+```bash
+docker build --build-arg RUST_VERSION=1.93 -t ugnosd:latest .
+```
+
+### Run (standalone)
+
+Default: data in a named volume, health server on `0.0.0.0:8080`:
+
+```bash
+docker run -d --name ugnosd -p 8080:8080 -v ugnos_data:/var/lib/ugnos ugnosd:latest
+curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/readyz
+```
+
+With a config file (mount TOML and optional env overrides):
+
+```bash
+docker run -d --name ugnosd -p 8080:8080 \
+  -v ugnos_data:/var/lib/ugnos \
+  -v /path/to/ugnosd.toml:/etc/ugnosd.toml:ro \
+  -e UGNOS_HTTP_BIND=0.0.0.0:8080 \
+  ugnosd:latest --config /etc/ugnosd.toml
+```
+
+Give the daemon time to shut down cleanly (default Docker stop timeout is 10s; the daemon may need up to 30s to drain connections and flush WAL):
+
+```bash
+docker stop -t 35 ugnosd
+```
+
+### Quickstart with Docker Compose
+
+From the **ugnos** project root:
+
+```bash
+docker compose up -d
+curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/readyz
+docker compose down
+```
+
+Compose defines a healthcheck and `stop_grace_period: 35s` so `docker compose down` sends SIGTERM and allows the daemon to flush before exit.
+
+### Publish to a registry
+
+Tag and push to your registry (e.g. GitHub Container Registry or Docker Hub):
+
+```bash
+# Example: GHCR
+docker tag ugnosd:latest ghcr.io/YOUR_ORG/ugnosd:0.4.1
+docker push ghcr.io/YOUR_ORG/ugnosd:0.4.1
+
+# Example: Docker Hub
+docker tag ugnosd:latest YOUR_USER/ugnosd:0.4.1
+docker push YOUR_USER/ugnosd:0.4.1
+```
+
+Use a versioned tag (e.g. `0.4.1`) for production; avoid relying on `latest` for deployments.
+
+### Verification (adversarial)
+
+- **Liveness/readiness:** After `docker compose up -d`, `GET /healthz` and `GET /readyz` must return 200. If readiness returns 503, the DB may still be recovering; wait a few seconds.
+- **Graceful shutdown:** Run the container, write data (when ingest APIs exist), then `docker compose down` or `docker stop -t 35 ugnosd`. Container should exit 0; on next start, data should still be present (persistence across restart).
+- **Invalid config:** Override with invalid `UGNOS_HTTP_BIND` (e.g. `not-a-host`) and confirm the container exits non-zero and does not serve traffic.
+
+From the project root you can run an automated verification script (builds image, brings up compose, checks health endpoints, asserts invalid config fails, then tears down):
+
+```bash
+./scripts/verify-docker.sh
+```
+
+## How to build and test (this workspace)
+
+From the **ugnos** project root:
+
+```bash
+cargo build --release
+cargo test
 ```
 
 ## Benchmarks

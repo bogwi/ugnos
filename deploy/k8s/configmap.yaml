@@ -1,0 +1,16 @@
+# Optional ConfigMap to run ugnosd with a config file.
+# Mount as volume and pass --config /etc/ugnosd/ugnosd.toml in deployment args.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ugnosd-config
+data:
+  ugnosd.toml: |
+    data_dir = "/var/lib/ugnos"
+    flush_interval_secs = 1
+    enable_wal = true
+    enable_snapshots = true
+    enable_segments = true
+    http_bind = "0.0.0.0:8080"
+    [segment_store]
+    compaction_check_interval_secs = 1

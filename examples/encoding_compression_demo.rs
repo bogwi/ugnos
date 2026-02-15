@@ -26,7 +26,7 @@ fn main() -> Result<(), DbError> {
         // `.unwrap_or(0)` is a small hack to keep this example running
         // in production you have all means to handle this .query() error:
         // DbError::SeriesNotFound
-        .unwrap_or(0); 
+        .unwrap_or(0);
 
     let mut tags_a = TagSet::new();
     tags_a.insert("host".to_string(), "server1".to_string());

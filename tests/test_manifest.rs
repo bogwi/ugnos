@@ -97,7 +97,10 @@ fn assert_manifest_invariants(m: &TestManifest) {
 
     for s in &m.segments {
         assert!(s.id > 0, "segment id must be > 0");
-        assert!(!s.file_name.is_empty(), "segment file_name must be non-empty");
+        assert!(
+            !s.file_name.is_empty(),
+            "segment file_name must be non-empty"
+        );
         assert!(
             s.level <= 1,
             "segment level must be 0 or 1 in tests (got {})",
@@ -134,4 +137,3 @@ fn assert_manifest_invariants(m: &TestManifest) {
         }
     }
 }
-

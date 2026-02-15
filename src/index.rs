@@ -56,10 +56,7 @@ impl CardinalityTracker {
     /// Returns current cardinality for the given scope.
     pub fn current_count(&self, scope: &str) -> u64 {
         let guard = self.by_scope.read().expect("cardinality tracker lock");
-        guard
-            .get(scope)
-            .map(|s| s.len() as u64)
-            .unwrap_or(0)
+        guard.get(scope).map(|s| s.len() as u64).unwrap_or(0)
     }
 
     /// Registers a series key in the given scope. Returns `Ok(())` if the key was new and
@@ -150,7 +147,11 @@ mod tests {
         let tracker = CardinalityTracker::new(None);
         for i in 0..1000 {
             tracker
-                .register(DEFAULT_CARDINALITY_SCOPE, "s", &tags(&[("i", &i.to_string())]))
+                .register(
+                    DEFAULT_CARDINALITY_SCOPE,
+                    "s",
+                    &tags(&[("i", &i.to_string())]),
+                )
                 .unwrap();
         }
         assert_eq!(tracker.current_count(DEFAULT_CARDINALITY_SCOPE), 1000);

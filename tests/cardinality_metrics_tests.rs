@@ -86,28 +86,13 @@ fn cardinality_limit_rejection_emits_explicit_error_and_metrics() {
     let db = DbCore::with_config(cfg).expect("db init");
 
     // Two distinct series keys (same series name, different tagsets) under the same tenant scope.
-    db.insert(
-        "m",
-        1,
-        1.0,
-        tags(&[("tenant", scope), ("host", "a")]),
-    )
-    .unwrap();
-    db.insert(
-        "m",
-        2,
-        2.0,
-        tags(&[("tenant", scope), ("host", "b")]),
-    )
-    .unwrap();
+    db.insert("m", 1, 1.0, tags(&[("tenant", scope), ("host", "a")]))
+        .unwrap();
+    db.insert("m", 2, 2.0, tags(&[("tenant", scope), ("host", "b")]))
+        .unwrap();
 
     // Third distinct series key => must be rejected.
-    let r = db.insert(
-        "m",
-        3,
-        3.0,
-        tags(&[("tenant", scope), ("host", "c")]),
-    );
+    let r = db.insert("m", 3, 3.0, tags(&[("tenant", scope), ("host", "c")]));
     assert!(
         matches!(r, Err(DbError::SeriesCardinalityLimitExceeded { .. })),
         "expected explicit SeriesCardinalityLimitExceeded; got: {r:?}"
@@ -117,7 +102,8 @@ fn cardinality_limit_rejection_emits_explicit_error_and_metrics() {
     std::thread::sleep(Duration::from_millis(60));
     let after = prom.render();
 
-    let after_rejections = parse_counter_with_scope(&after, "ugnos_cardinality_limit_rejections", scope);
+    let after_rejections =
+        parse_counter_with_scope(&after, "ugnos_cardinality_limit_rejections", scope);
     let after_cardinality =
         parse_gauge_with_scope(&after, "ugnos_series_cardinality", scope).unwrap_or(0.0);
 
@@ -138,4 +124,3 @@ fn cardinality_limit_rejection_emits_explicit_error_and_metrics() {
         after
     );
 }
-

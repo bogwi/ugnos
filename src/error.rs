@@ -39,9 +39,7 @@ pub enum DbError {
     Internal(String),
 
     /// Series cardinality limit exceeded for the given scope (tenant/namespace).
-    #[error(
-        "Series cardinality limit exceeded: current={current}, limit={limit}, scope={scope}"
-    )]
+    #[error("Series cardinality limit exceeded: current={current}, limit={limit}, scope={scope}")]
     SeriesCardinalityLimitExceeded {
         /// Current cardinality (distinct series keys) in the scope.
         current: u64,

@@ -15,7 +15,7 @@ mod test_manifest;
 const SEG_MAGIC: &[u8; 8] = b"UGNSEG01";
 
 // V2 series block header layout (encoding.rs): magic[0..8], version[8..12], row_count[12..16],
-// codec[16..20], compression_param[20..24], uncompressed_len[24..28], 
+// codec[16..20], compression_param[20..24], uncompressed_len[24..28],
 // uncompressed_crc32[28..32], stored_len[32..36], payload[36..].
 // Acceptance criterion: storage format includes block-level checksums and versioning.
 const SERIES_BLOCK_V2_VERSION_OFFSET: usize = 8;
@@ -117,7 +117,9 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
 
     const INDEX_VERSION_TAG_INDEX: u8 = 2;
     let mut off = 0usize;
-    let (series_count, entry_extra) = if index_bytes.len() >= 5 && index_bytes[0] == INDEX_VERSION_TAG_INDEX {
+    let (series_count, entry_extra) = if index_bytes.len() >= 5
+        && index_bytes[0] == INDEX_VERSION_TAG_INDEX
+    {
         let count = u32::from_le_bytes(index_bytes[1..5].try_into().expect("count bytes")) as usize;
         off = 5;
         // version 2: after offset/len we have row_count, min_ts, max_ts, crc32, tag_index_offset, tag_index_len
@@ -141,7 +143,7 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
     out
 }
 
-/// Acceptance criterion: 
+/// Acceptance criterion:
 /// "Storage format includes block-level checksums and versioning."
 /// This test would FAIL if the format were changed to
 /// remove the version field or the payload checksum field.
@@ -436,8 +438,8 @@ fn test_space_reduction_with_compression_is_measurable() {
     );
 }
 
-/// Acceptance criterion: 
-/// "measurable space reduction without breaking p99 latency targets." 
+/// Acceptance criterion:
+/// "measurable space reduction without breaking p99 latency targets."
 /// This test asserts p99 query latency stays within a target when using encoded/compressed segments.
 const P99_QUERY_LATENCY_TARGET_MS: u64 = 200;
 
@@ -479,8 +481,7 @@ fn test_ac_query_latency_with_encoded_segments_within_target() {
     );
 }
 
-
-/// If delta encoding or decoder is wrong, 
+/// If delta encoding or decoder is wrong,
 /// reordered timestamps could produce wrong or silent corruption.
 #[test]
 fn test_breakit_roundtrip_preserves_timestamp_order_and_values_bit_exact() {
@@ -528,7 +529,7 @@ fn test_breakit_roundtrip_preserves_timestamp_order_and_values_bit_exact() {
     }
 }
 
-/// If checksum were skipped, 
+/// If checksum were skipped,
 /// corrupting only the payload (and not the header) could return wrong data.
 /// We corrupt a byte in the block and expect a corruption error (segment block CRC or payload CRC).
 #[test]
@@ -567,7 +568,7 @@ fn test_breakit_corrupt_any_byte_in_block_yields_corruption_error() {
     }
 }
 
-/// Adversarial: 
+/// Adversarial:
 /// all NaN payloads; if Gorilla or decoder mishandles NaN, this would produce wrong or panic.
 #[test]
 fn test_breakit_all_nan_roundtrip() {
