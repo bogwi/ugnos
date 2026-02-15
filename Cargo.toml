@@ -1,7 +1,8 @@
 [package]
 name = "ugnos"
-version = "0.4.1"
-edition = "2021"
+version = "0.4.2"
+edition = "2024"
+rust-version = "1.85"
 description = "A high-performance, concurrent time-series database core written in Rust, designed for efficient IoT data ingestion, real-time analytics, and monitoring."
 license = "MIT OR Apache-2.0"
 authors = ["Dan Vi <bogwi@rakumail.jp>"]
@@ -28,6 +29,13 @@ metrics-exporter-prometheus = { version = "0.18.1", default-features = false, op
 lz4_flex = "0.12.0"
 zstd = "0.13.3"
 roaring = "0.11.3"
+clap = { version = "4.5", features = ["derive", "env"] }
+config = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["server", "server-graceful", "server-auto", "http1", "tokio"] }
+bytes = "1"
 # Add other dependencies as needed, e.g.:
 # log = "0.4"
 # chrono = "0.4"
@@ -37,6 +45,10 @@ roaring = "0.11.3"
 # via `default-features = false` if they only want the `metrics` facade instrumentation.
 default = ["prometheus"]
 prometheus = ["dep:metrics-exporter-prometheus"]
+
+[[bin]]
+name = "ugnosd"
+path = "src/bin/ugnosd.rs"
 
 [dev-dependencies]
 criterion = "0.5"

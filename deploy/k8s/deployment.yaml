@@ -1,0 +1,70 @@
+# Kubernetes Deployment for ugnosd. Apply with: kubectl apply -f deploy/k8s/
+# Uses default config; override with ConfigMap (see configmap.yaml) or env.
+#
+# Image: Replace with your registry image (e.g. ghcr.io/org/ugnosd:0.4.2). For local
+# clusters use `docker build -t ugnosd:latest .` then load (e.g. kind load docker-image ugnosd:latest)
+# and set imagePullPolicy: IfNotPresent.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ugnosd
+  labels:
+    app: ugnosd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ugnosd
+  template:
+    metadata:
+      labels:
+        app: ugnosd
+    spec:
+      terminationGracePeriodSeconds: 35
+      # Match Dockerfile: USER ugnos (uid/gid 10001). fsGroup makes emptyDir writable by that group.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: ugnosd
+          image: ugnosd:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --data-dir
+            - /var/lib/ugnos
+            - --http-bind
+            - "0.0.0.0:8080"
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ugnos
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+      volumes:
+        - name: data
+          emptyDir: {}
+          # For persistence, use a PVC:
+          # persistentVolumeClaim:
+          #   claimName: ugnosd-data

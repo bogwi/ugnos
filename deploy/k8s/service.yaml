@@ -1,0 +1,13 @@
+# Service for ugnosd. Apply with: kubectl apply -f deploy/k8s/
+apiVersion: v1
+kind: Service
+metadata:
+  name: ugnosd
+spec:
+  selector:
+    app: ugnosd
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP

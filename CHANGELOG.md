@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+### [0.4.2] - 2026-02-15
+
+### Added
+*Deliverables:*
+
+- Production-grade daemon with config file, env overrides, and CLI flags.
+- Health endpoints, readiness/liveness, graceful shutdown, safe startup checks.
+- Docker image build + publish instructions; `docker compose` quickstart for local evaluation.
+- Verification scripts in `scripts/`: `verify-docker.sh` (Docker/compose + health checks), `verify-k8s-local.sh` (kind + deploy + healthz/readyz), `verify-k8s-deploy.sh` (existing cluster), `verify-k8s-manifests.sh` (manifest validation).
+
+*Acceptance criteria:*
+
+- Runs as a single static-ish artifact (per platform), with documented deployment recipes (systemd, Docker, Kubernetes).
+- Graceful shutdown guarantees WAL flush policy and clean compaction stop.
+- Docker image can start `ugnosd` with a config and serves health endpoints (`/healthz`, `/readyz`).
+
+*Assertions (implemented):*
+
+- README "Deployment recipes", `deploy/systemd/ugnosd.service`, `deploy/k8s/*.yaml` 
+- `tests/daemon_health_tests.rs`: `graceful_shutdown_prints_flush_and_complete` (exit 0 on Unix), `graceful_shutdown_then_restart_recovery_succeeds`; daemon calls `db.flush()` then `drop(db)`. 
+
+## [Released]
+
 ### [0.4.1] - 2026-02-11
 
 ### Changed

@@ -201,7 +201,11 @@ fn read_scope_meta(dir: &Path) -> Option<String> {
     let mut s = String::new();
     f.read_to_string(&mut s).ok()?;
     let s = s.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn load_scope_dir(dir: &Path) -> Result<Vec<SeriesKey>, DbError> {
@@ -339,4 +343,3 @@ fn sync_parent_dir(path: &Path) -> Result<(), DbError> {
     dir.sync_data()?;
     Ok(())
 }
-

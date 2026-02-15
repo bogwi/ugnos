@@ -1,8 +1,8 @@
 //! Core database logic: main API, background flush thread, and orchestration of storage, buffer, and persistence.
 
 use crate::buffer::WriteBuffer;
-use crate::error::DbError;
 use crate::cardinality_store::CardinalityStore;
+use crate::error::DbError;
 use crate::index::{CardinalityTracker, SeriesKey, DEFAULT_CARDINALITY_SCOPE};
 use crate::persistence::{Snapshotter, WriteAheadLog};
 use crate::query::execute_query;
@@ -774,10 +774,7 @@ impl DbCore {
             .filter(|s| !s.is_empty())
             .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
 
-        let was_new = match self
-            .cardinality
-            .register_and_was_new(scope, series, &tags)
-        {
+        let was_new = match self.cardinality.register_and_was_new(scope, series, &tags) {
             Ok(was_new) => was_new,
             Err(e) => {
                 db_metrics::record_cardinality_limit_rejected(scope);

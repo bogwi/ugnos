@@ -1,0 +1,36 @@
+# Example config for ugnosd. Copy to ugnosd.toml or pass via --config.
+# Environment variables UGNOS_* override (e.g. UGNOS_DATA_DIR, UGNOS_HTTP_BIND).
+# CLI flags override env and file.
+
+# HTTP listen address for /healthz and /readyz (liveness/readiness).
+# http_bind = "127.0.0.1:8080"
+# For Docker/Kubernetes, use 0.0.0.0:8080 so the health endpoint is reachable from outside.
+# http_bind = "0.0.0.0:8080"
+
+data_dir = "./data"
+flush_interval_secs = 1
+wal_buffer_size = 1000
+enable_wal = true
+enable_snapshots = true
+snapshot_interval_secs = 900
+enable_segments = true
+# retention_ttl_secs = 604800
+retention_check_interval_secs = 1
+# max_series_cardinality = 100000
+# cardinality_scope_tag_key = "tenant"
+
+[segment_store]
+compaction_check_interval_secs = 1
+l0_compaction_trigger_segment_count = 4
+enable_tag_index = true
+# l0_compaction_trigger_total_bytes = 134217728
+# l0_compaction_trigger_max_age_secs = 3600
+
+[segment_store.encoding]
+float_encoding = "raw64"
+tag_encoding = "dictionary"
+# Compression: table with type = "none" | "lz4" | "zstd"; for zstd add level = 3
+[segment_store.encoding.compression]
+type = "none"
+# type = "zstd"
+# level = 3

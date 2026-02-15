@@ -21,7 +21,9 @@ fn parse_sample(rendered: &str, metric: &str) -> Option<f64> {
         let mut parts = line.split_whitespace();
         let key = parts.next()?;
         let val = parts.next()?;
-        if key == metric || (key.starts_with(metric) && key.as_bytes().get(metric.len()) == Some(&b'{')) {
+        if key == metric
+            || (key.starts_with(metric) && key.as_bytes().get(metric.len()) == Some(&b'{'))
+        {
             if let Ok(v) = val.parse::<f64>() {
                 return Some(v);
             }
@@ -90,4 +92,3 @@ fn segment_postings_index_skips_non_matching_segments() {
         after
     );
 }
-

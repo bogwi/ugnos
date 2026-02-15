@@ -5,6 +5,7 @@ use crate::types::{Row, TagSet, Timestamp, Value};
 
 use crc32fast::Hasher as Crc32;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
@@ -15,7 +16,7 @@ use std::path::Path;
 ///
 /// Note: This is persisted into each series block header so readers do not require
 /// out-of-band configuration. Configuration only affects *newly written* blocks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentEncodingConfig {
     pub float_encoding: FloatEncoding,
     pub tag_encoding: TagEncoding,
@@ -32,7 +33,9 @@ impl Default for SegmentEncodingConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Float encoding strategy for series blocks. Serde: lowercase string (e.g. `"raw64"`, `"gorillaxor"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FloatEncoding {
     /// Store IEEE-754 bits verbatim (8 bytes/value).
     Raw64,
@@ -40,13 +43,17 @@ pub enum FloatEncoding {
     GorillaXor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tag encoding strategy. Serde: lowercase string (e.g. `"dictionary"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TagEncoding {
     /// Dictionary encode all tag keys/values within the block and store per-row ids.
     Dictionary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-block compression. Serde: adjacently tagged table `type` + optional `level` (e.g. `type = "zstd", level = 3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "level", rename_all = "lowercase")]
 pub enum BlockCompression {
     None,
     Lz4,
@@ -1181,7 +1188,8 @@ fn build_tag_dict(rows: &[Row]) -> (Vec<String>, HashMap<(String, String), (u32,
     let mut kv_to_id: HashMap<(String, String), (u32, u32)> = HashMap::new();
     for r in rows {
         for (k, v) in &r.tags {
-            if let (Some(&kid), Some(&vid)) = (str_to_id.get(k.as_str()), str_to_id.get(v.as_str())) {
+            if let (Some(&kid), Some(&vid)) = (str_to_id.get(k.as_str()), str_to_id.get(v.as_str()))
+            {
                 kv_to_id.insert((k.clone(), v.clone()), (kid, vid));
             }
         }
@@ -1249,8 +1257,8 @@ pub(crate) fn build_tag_block_index(rows: &[Row]) -> Result<Vec<u8>, DbError> {
         .len()
         .try_into()
         .map_err(|_| DbError::Internal("Tag index payload too large".to_string()))?;
-    let zstd = zstd::stream::encode_all(std::io::Cursor::new(&raw), 3)
-        .map_err(|e| DbError::Io(e))?;
+    let zstd =
+        zstd::stream::encode_all(std::io::Cursor::new(&raw), 3).map_err(|e| DbError::Io(e))?;
     let zstd_len: u32 = zstd
         .len()
         .try_into()
@@ -1305,8 +1313,12 @@ impl TagBlockIndex {
         }
         let (row_count, dict) = match self {
             TagBlockIndex::RoaringV3 { .. } => return None,
-            TagBlockIndex::BitmapV1 { row_count, dict, .. } => (*row_count, dict),
-            TagBlockIndex::PostingsV2 { row_count, dict, .. } => (*row_count, dict),
+            TagBlockIndex::BitmapV1 {
+                row_count, dict, ..
+            } => (*row_count, dict),
+            TagBlockIndex::PostingsV2 {
+                row_count, dict, ..
+            } => (*row_count, dict),
         };
         let _ = row_count;
 
@@ -1316,7 +1328,9 @@ impl TagBlockIndex {
         }
 
         match self {
-            TagBlockIndex::BitmapV1 { row_count, bitmaps, .. } => {
+            TagBlockIndex::BitmapV1 {
+                row_count, bitmaps, ..
+            } => {
                 let bytes = (*row_count + 7) / 8;
                 let mut result: Option<Vec<u8>> = None;
                 for (k, v) in filter {
@@ -1327,15 +1341,14 @@ impl TagBlockIndex {
                         None => bm.clone(),
                         Some(acc) => {
                             debug_assert_eq!(acc.len(), bm.len());
-                            acc.iter()
-                                .zip(bm.iter())
-                                .map(|(a, b)| a & b)
-                                .collect()
+                            acc.iter().zip(bm.iter()).map(|(a, b)| a & b).collect()
                         }
                     });
                 }
                 // Defensive: ensure correct length.
-                result.filter(|bm| bm.len() == bytes).map(TagIndexCandidates::Bitmap)
+                result
+                    .filter(|bm| bm.len() == bytes)
+                    .map(TagIndexCandidates::Bitmap)
             }
             TagBlockIndex::PostingsV2 { postings, .. } => {
                 let mut acc: Option<Vec<u32>> = None;
@@ -1418,10 +1431,7 @@ fn intersect_sorted_u32(a: &[u32], b: &[u32]) -> Vec<u32> {
 }
 
 /// Parses a tag block index blob.
-pub(crate) fn parse_tag_block_index(
-    bytes: &[u8],
-    path: &Path,
-) -> Result<TagBlockIndex, DbError> {
+pub(crate) fn parse_tag_block_index(bytes: &[u8], path: &Path) -> Result<TagBlockIndex, DbError> {
     let mut cur = std::io::Cursor::new(bytes);
     let mut magic = [0u8; 8];
     cur.read_exact(&mut magic)?;
@@ -1584,7 +1594,9 @@ pub(crate) fn parse_tag_block_index(
         })? as usize;
         let mut b = vec![0u8; n];
         cur.read_exact(&mut b)?;
-        dict.push(String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?);
+        dict.push(
+            String::from_utf8(b).map_err(|e| DbError::Internal(format!("Invalid UTF-8: {}", e)))?,
+        );
     }
     let num_entries = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
         details: d,
@@ -1746,7 +1758,10 @@ mod encoding_compression_acceptance_tests {
         for (a, b) in decoded.iter().zip(rows.iter()) {
             assert_eq!(a.seq, b.seq);
             assert_eq!(a.timestamp, b.timestamp);
-            assert!(a.value.to_bits() == b.value.to_bits(), "value must be bit-exact");
+            assert!(
+                a.value.to_bits() == b.value.to_bits(),
+                "value must be bit-exact"
+            );
             assert_eq!(a.tags, b.tags);
         }
 

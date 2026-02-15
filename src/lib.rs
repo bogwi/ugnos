@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 // Declare modules
 pub mod buffer;
+mod cardinality_store;
 pub mod core;
 pub mod encoding;
 pub mod error;
@@ -12,7 +13,6 @@ pub mod storage;
 pub mod telemetry;
 pub mod types;
 pub mod utils;
-mod cardinality_store;
 
 /// Configuration options for the database core.
 pub use crate::core::DbConfig;

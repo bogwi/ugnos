@@ -39,13 +39,14 @@ fn breakit_cardinality_over_limit_returns_error() {
     db.insert("s", t0, 1.0, tags(&[("a", "1")])).unwrap();
     db.insert("s", t0 + 1, 2.0, tags(&[("a", "2")])).unwrap();
     let r = db.insert("s", t0 + 2, 3.0, tags(&[("a", "3")]));
-    assert!(
-        r.is_err(),
-        "insert beyond cardinality limit should fail"
-    );
+    assert!(r.is_err(), "insert beyond cardinality limit should fail");
     let e = r.unwrap_err();
     match &e {
-        DbError::SeriesCardinalityLimitExceeded { current, limit, scope } => {
+        DbError::SeriesCardinalityLimitExceeded {
+            current,
+            limit,
+            scope,
+        } => {
             assert_eq!(*current, 2);
             assert_eq!(*limit, 2);
             assert!(!scope.is_empty());
@@ -142,13 +143,8 @@ fn breakit_cardinality_is_enforced_per_scope_tag_key() {
 
     let t0 = 1000u64;
     // Tenant A hits its limit.
-    db.insert(
-        "s",
-        t0,
-        1.0,
-        tags(&[("tenant", "acme/prod"), ("a", "1")]),
-    )
-    .unwrap();
+    db.insert("s", t0, 1.0, tags(&[("tenant", "acme/prod"), ("a", "1")]))
+        .unwrap();
     db.insert(
         "s",
         t0 + 1,
@@ -168,26 +164,11 @@ fn breakit_cardinality_is_enforced_per_scope_tag_key() {
     );
 
     // Tenant B is independent and should still accept up to its own limit.
-    db.insert(
-        "s",
-        t0 + 10,
-        10.0,
-        tags(&[("tenant", "beta"), ("a", "1")]),
-    )
-    .unwrap();
-    db.insert(
-        "s",
-        t0 + 11,
-        11.0,
-        tags(&[("tenant", "beta"), ("a", "2")]),
-    )
-    .unwrap();
-    let r2 = db.insert(
-        "s",
-        t0 + 12,
-        12.0,
-        tags(&[("tenant", "beta"), ("a", "3")]),
-    );
+    db.insert("s", t0 + 10, 10.0, tags(&[("tenant", "beta"), ("a", "1")]))
+        .unwrap();
+    db.insert("s", t0 + 11, 11.0, tags(&[("tenant", "beta"), ("a", "2")]))
+        .unwrap();
+    let r2 = db.insert("s", t0 + 12, 12.0, tags(&[("tenant", "beta"), ("a", "3")]));
     assert!(r2.is_err(), "tenant beta must also enforce its own limit");
 }
 
@@ -207,9 +188,12 @@ fn breakit_tag_filter_results_match_with_and_without_tag_index() {
     cfg1.segment_store.enable_tag_index = true;
     let db1 = DbCore::with_config(cfg1).unwrap();
     db1.insert("m", t0, 1.0, tags(&[("host", "a")])).unwrap();
-    db1.insert("m", t0 + 1, 2.0, tags(&[("host", "b")])).unwrap();
-    db1.insert("m", t0 + 2, 3.0, tags(&[("host", "b")])).unwrap();
-    db1.insert("m", t0 + 3, 4.0, tags(&[("host", "c")])).unwrap();
+    db1.insert("m", t0 + 1, 2.0, tags(&[("host", "b")]))
+        .unwrap();
+    db1.insert("m", t0 + 2, 3.0, tags(&[("host", "b")]))
+        .unwrap();
+    db1.insert("m", t0 + 3, 4.0, tags(&[("host", "c")]))
+        .unwrap();
     db1.flush().unwrap();
     let with_index = db1.query("m", t0..t0 + 100, Some(&filter)).unwrap();
 
@@ -219,9 +203,12 @@ fn breakit_tag_filter_results_match_with_and_without_tag_index() {
     cfg2.segment_store.enable_tag_index = false;
     let db2 = DbCore::with_config(cfg2).unwrap();
     db2.insert("m", t0, 1.0, tags(&[("host", "a")])).unwrap();
-    db2.insert("m", t0 + 1, 2.0, tags(&[("host", "b")])).unwrap();
-    db2.insert("m", t0 + 2, 3.0, tags(&[("host", "b")])).unwrap();
-    db2.insert("m", t0 + 3, 4.0, tags(&[("host", "c")])).unwrap();
+    db2.insert("m", t0 + 1, 2.0, tags(&[("host", "b")]))
+        .unwrap();
+    db2.insert("m", t0 + 2, 3.0, tags(&[("host", "b")]))
+        .unwrap();
+    db2.insert("m", t0 + 3, 4.0, tags(&[("host", "c")]))
+        .unwrap();
     db2.flush().unwrap();
     let without_index = db2.query("m", t0..t0 + 100, Some(&filter)).unwrap();
 
@@ -268,9 +255,12 @@ fn breakit_tag_filter_multiple_tags_and_semantics() {
     let dir = TempDir::new().unwrap();
     let db = DbCore::with_config(make_segments_cfg(dir.path(), None)).unwrap();
     let t0 = 1000u64;
-    db.insert("s", t0, 1.0, tags(&[("a", "1"), ("b", "x")])).unwrap();
-    db.insert("s", t0 + 1, 2.0, tags(&[("a", "1"), ("b", "y")])).unwrap();
-    db.insert("s", t0 + 2, 3.0, tags(&[("a", "1"), ("b", "x")])).unwrap();
+    db.insert("s", t0, 1.0, tags(&[("a", "1"), ("b", "x")]))
+        .unwrap();
+    db.insert("s", t0 + 1, 2.0, tags(&[("a", "1"), ("b", "y")]))
+        .unwrap();
+    db.insert("s", t0 + 2, 3.0, tags(&[("a", "1"), ("b", "x")]))
+        .unwrap();
     db.flush().unwrap();
 
     let filter = tags(&[("a", "1"), ("b", "x")]);
