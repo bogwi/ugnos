@@ -256,7 +256,7 @@ pub(crate) fn decode_series_block_v2_container(
                 details: format!("Unknown compression codec {} in {:?}", other, path),
                 series: None,
                 timestamp: None,
-            })
+            });
         }
     };
 

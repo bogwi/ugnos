@@ -14,6 +14,9 @@ pub mod telemetry;
 pub mod types;
 pub mod utils;
 
+/// gRPC (Tonic) API for ingest, query, and administration.
+pub mod grpc;
+
 /// Configuration options for the database core.
 pub use crate::core::DbConfig;
 /// Main entry point for interacting with the time-series database core.

@@ -3,20 +3,20 @@
 use crate::buffer::WriteBuffer;
 use crate::cardinality_store::CardinalityStore;
 use crate::error::DbError;
-use crate::index::{CardinalityTracker, SeriesKey, DEFAULT_CARDINALITY_SCOPE};
+use crate::index::{CardinalityTracker, DEFAULT_CARDINALITY_SCOPE, SeriesKey};
 use crate::persistence::{Snapshotter, WriteAheadLog};
 use crate::query::execute_query;
 use crate::segments::{SegmentStore, SegmentStoreConfig};
 use crate::storage::InMemoryStorage;
 use crate::telemetry::db_metrics;
-use crate::telemetry::{noop_event_listener, DbEvent, DbEventListener};
+use crate::telemetry::{DbEvent, DbEventListener, noop_event_listener};
 use crate::types::{DataPoint, Row, TagSet, Timestamp, Value};
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -803,7 +803,7 @@ impl DbCore {
 
         // Acquire lock on the write buffer
         let mut buffer_guard = self.write_buffer.lock()?; // Propagate PoisonError
-                                                          // Stage the data point
+        // Stage the data point
         let res = buffer_guard.stage(series, row);
         if res.is_ok() {
             db_metrics::record_ingest_points(1);

@@ -6,7 +6,7 @@ use crc32fast::Hasher as Crc32;
 use tempfile::tempdir;
 
 use ugnos::encoding::{
-    BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding, SER_BLOCK_MAGIC,
+    BlockCompression, FloatEncoding, SER_BLOCK_MAGIC, SegmentEncodingConfig, TagEncoding,
 };
 use ugnos::{DbConfig, DbCore, DbError, TagSet};
 

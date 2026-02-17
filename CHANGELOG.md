@@ -5,9 +5,37 @@ All notable changes to the Rust Time-Series Database Core will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Milestone 2 — Query engine + APIs
+Goal: become usable as a production database via a networked server binary and stable client surface.
+
+## [Pass-through]
+
+### [0.4.3] - 2026-02-17 - External APIs (native)
+
+### Added
+*Deliverables:*
+
+- gRPC (Tonic) API for ingest/query/administration.
+- AuthN/AuthZ enforcement for the server API surface.
+
+*Acceptance criteria:*
+
+- End-to-end integration tests validate ingest → persist → restart → query.
+- Backpressure behavior is well-defined (429/RESOURCE_EXHAUSTED) with metrics.
+- AuthN/AuthZ is deny-by-default and covers all **gRPC** endpoints shipped in Milestone 2.
+
+*Assertions (implemented):*
+
+- `tests/grpc_integration_tests.rs`: `ingest_persist_restart_query_via_grpc` (write 3 pts → flush → drop → recover → query = 3 pts with correct values).
+- `src/grpc/service.rs`: `Write` fails fast on `SeriesCardinalityLimitExceeded` with `RESOURCE_EXHAUSTED`; `db_error_to_status` maps all backpressure errors; `ugnos_cardinality_limit_rejections` counter + `ugnos_series_cardinality` gauge (DB level); `ugnos_grpc_requests` counter + `ugnos_grpc_request_duration_seconds` histogram with method/code labels (gRPC level); integration tests: `grpc_write_cardinality_limit_returns_resource_exhausted`, `grpc_write_cardinality_mid_batch_reports_progress`, `grpc_write_existing_series_after_limit_succeeds`.
+- `src/grpc/auth.rs`: `GrpcAuthLayer` (Tower); deny-by-default (empty config denies all); `required_for_path` maps all 5 RPCs; constant-time token comparison; 401 (no/bad token) / 403 (missing permission) / deny unknown paths; integration tests: `grpc_auth_no_token_returns_unauthenticated`, `grpc_auth_wrong_token_returns_unauthenticated`, `grpc_auth_valid_token_missing_permission_returns_permission_denied`, `grpc_auth_valid_token_with_permission_succeeds`, `grpc_auth_empty_config_denies_all`, `grpc_auth_bearer_token_accepted`, `grpc_auth_compact_with_valid_token_succeeds`, `grpc_auth_compact_without_admin_denied`.
+
+### Changed
+- Change in `ci.yml`: On main we only save (no restore), so we never save the same key we restored. On branches/PRs we restore to compare against baseline.
+
 ## [Released]
 
-### [0.4.2] - 2026-02-15
+### [0.4.2] - 2026-02-15 - Server binary: `ugnosd`
 
 ### Added
 *Deliverables:*
@@ -41,9 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - README code exmaples formatting and clarity
 
+# Milestone 1 — Single-node durable storage engine
+Goal: move from "in-memory with WAL + snapshots" toward a **real on-disk engine** with retention and compaction.
+
+
 ## [Released]
 
-### [0.4.0] - 2026-02-10
+### [0.4.0] - 2026-02-10 - Indexing & cardinality controls
 
 ### Added
 
@@ -80,7 +112,7 @@ Note: Modern practice alignment
 
 ## [Released]
 
-### [0.3.1] - 2026-02-07
+### [0.3.1] - 2026-02-07 - Encoding & compression
 
 ### Added
 
@@ -92,7 +124,7 @@ Note: Modern practice alignment
 
 ## [Released]
 
-## [0.3.0] - 2026-02-02
+## [0.3.0] - 2026-02-02 - Storage engine: segment files + compaction
 
 ### Added
 
@@ -115,7 +147,10 @@ Note: Modern practice alignment
 
 - N/A
 
-## [0.2.3] - 2026-02-02
+# Milestone 0 — Hardening the existing core
+Goal: make today’s single-node core reliable, testable, and ready to become a storage engine component.
+
+## [0.2.3] - 2026-02-02 - Documentation correctness
 
 ### Added
 
@@ -126,7 +161,7 @@ Note: Modern practice alignment
 
 - README code examples are now deterministic and CI-safe (use temp dirs and `no_run` to avoid filesystem side-effects and flaky runtime behavior).
 
-## [0.2.2] - 2026-02-02
+## [0.2.2] - 2026-02-02 - Performance and observability scaffolding
 
 ### Added
 
@@ -145,7 +180,7 @@ Note: Modern practice alignment
 
 ## [Released]
 
-## [0.2.1] - 2026-02-01
+## [0.2.1] - 2026-02-01 - Reliability & correctness baseline
 
 ### Added
 

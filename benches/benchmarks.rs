@@ -1,6 +1,6 @@
 mod datasets;
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 use ugnos::encoding::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
 use ugnos::{DbConfig, DbCore, TagSet};

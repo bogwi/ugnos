@@ -1,4 +1,4 @@
-use iai_callgrind::{library_benchmark, library_benchmark_group, main, LibraryBenchmarkConfig};
+use iai_callgrind::{LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;

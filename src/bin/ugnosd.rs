@@ -19,7 +19,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::graceful::GracefulShutdown;
+use std::collections::HashSet;
 use ugnos::encoding::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
+use ugnos::grpc::{GrpcAuthConfig, GrpcAuthKey, GrpcAuthLayer, GrpcPermission};
 use ugnos::telemetry::noop_event_listener;
 use ugnos::{DbConfig, DbCore};
 
@@ -48,6 +50,10 @@ pub struct Cli {
     /// HTTP listen address for health/readiness endpoints (e.g. 127.0.0.1:8080 or 0.0.0.0:8080).
     #[arg(long, env = "UGNOS_HTTP_BIND")]
     pub http_bind: Option<String>,
+
+    /// gRPC listen address for ingest/query/administration (e.g. 127.0.0.1:50051 or 0.0.0.0:50051).
+    #[arg(long, env = "UGNOS_GRPC_BIND")]
+    pub grpc_bind: Option<String>,
 }
 
 // ---------- File/env config (all optional for partial config) ----------
@@ -61,6 +67,60 @@ pub struct EncodingFileConfig {
     pub tag_encoding: Option<TagEncoding>,
     /// Table form in TOML: `[segment_store.encoding.compression]` with `type = "none"` or `type = "zstd", level = 3`.
     pub compression: Option<BlockCompression>,
+}
+
+/// Single key entry for gRPC auth (file config). Permissions: "ingest", "query", "admin".
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct GrpcAuthKeyFile {
+    pub token: Option<String>,
+    pub permissions: Option<Vec<String>>,
+}
+
+/// gRPC auth section. Deny-by-default: if absent or keys empty, all gRPC requests are denied.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct GrpcAuthFileConfig {
+    pub keys: Option<Vec<GrpcAuthKeyFile>>,
+}
+
+fn parse_grpc_permission(s: &str) -> Option<GrpcPermission> {
+    match s.trim().to_lowercase().as_str() {
+        "ingest" => Some(GrpcPermission::Ingest),
+        "query" => Some(GrpcPermission::Query),
+        "admin" => Some(GrpcPermission::Admin),
+        _ => None,
+    }
+}
+
+/// Builds library GrpcAuthConfig from file config. Skips keys with missing token or empty permissions.
+fn grpc_auth_config_from_file(c: &Option<GrpcAuthFileConfig>) -> GrpcAuthConfig {
+    let keys = match c {
+        None => return GrpcAuthConfig::default(),
+        Some(cfg) => match &cfg.keys {
+            None => return GrpcAuthConfig::default(),
+            Some(k) => k,
+        },
+    };
+    let auth_keys: Vec<GrpcAuthKey> = keys
+        .iter()
+        .filter_map(|k| {
+            let token = k.token.as_deref().map(|s| s.as_bytes().to_vec())?;
+            let perms: HashSet<GrpcPermission> = k
+                .permissions
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|s| parse_grpc_permission(s))
+                .collect();
+            if perms.is_empty() {
+                return None;
+            }
+            Some(GrpcAuthKey {
+                token,
+                permissions: perms,
+            })
+        })
+        .collect();
+    GrpcAuthConfig { keys: auth_keys }
 }
 
 /// Segment store section in config file.
@@ -79,6 +139,8 @@ pub struct SegmentStoreFileConfig {
 pub struct DaemonFileConfig {
     /// HTTP listen address for /healthz and /readyz (e.g. "127.0.0.1:8080").
     pub http_bind: Option<String>,
+    /// gRPC listen address for ingest/query/administration (e.g. "127.0.0.1:50051").
+    pub grpc_bind: Option<String>,
     pub data_dir: Option<String>,
     pub flush_interval_secs: Option<u64>,
     pub wal_buffer_size: Option<usize>,
@@ -92,27 +154,35 @@ pub struct DaemonFileConfig {
     pub cardinality_scope_tag_key: Option<String>,
     #[serde(rename = "segment_store")]
     pub segment_store: Option<SegmentStoreFileConfig>,
+    #[serde(rename = "grpc_auth")]
+    pub grpc_auth: Option<GrpcAuthFileConfig>,
 }
 
-/// Runtime options for the daemon (HTTP bind, etc.) derived from config + env + CLI.
+/// Runtime options for the daemon (HTTP and gRPC bind, gRPC auth) derived from config + env + CLI.
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     /// Address to bind the HTTP health/readiness server.
     pub http_bind: SocketAddr,
+    /// Address to bind the gRPC server.
+    pub grpc_bind: SocketAddr,
+    /// gRPC AuthN/AuthZ config. Deny-by-default: empty keys ⇒ all gRPC requests denied.
+    pub grpc_auth: GrpcAuthConfig,
 }
 
 impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
             http_bind: "127.0.0.1:8080".parse().expect("default http_bind"),
+            grpc_bind: "127.0.0.1:50051".parse().expect("default grpc_bind"),
+            grpc_auth: GrpcAuthConfig::default(),
         }
     }
 }
 
-/// Parse `http_bind` string to `SocketAddr`. Returns error message on failure.
-fn parse_http_bind(s: &str) -> Result<SocketAddr, String> {
+/// Parse a bind address string to `SocketAddr`. Returns error message on failure.
+fn parse_bind_addr(s: &str, name: &str) -> Result<SocketAddr, String> {
     s.parse::<SocketAddr>()
-        .map_err(|e| format!("invalid http_bind {:?}: {}", s, e))
+        .map_err(|e| format!("invalid {} {:?}: {}", name, s, e))
 }
 
 /// Load merged config and daemon options. CLI overrides file/env for both.
@@ -156,9 +226,21 @@ fn load_daemon_config(cli: &Cli) -> Result<(DbConfig, DaemonOptions), String> {
         .as_deref()
         .or(partial.http_bind.as_deref())
         .unwrap_or("127.0.0.1:8080");
-    let http_bind = parse_http_bind(http_bind_str)?;
+    let http_bind = parse_bind_addr(http_bind_str, "http_bind")?;
 
-    let options = DaemonOptions { http_bind };
+    let grpc_bind_str = cli
+        .grpc_bind
+        .as_deref()
+        .or(partial.grpc_bind.as_deref())
+        .unwrap_or("127.0.0.1:50051");
+    let grpc_bind = parse_bind_addr(grpc_bind_str, "grpc_bind")?;
+
+    let grpc_auth = grpc_auth_config_from_file(&partial.grpc_auth);
+    let options = DaemonOptions {
+        http_bind,
+        grpc_bind,
+        grpc_auth,
+    };
     Ok((db_config, options))
 }
 
@@ -280,7 +362,7 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {}
@@ -291,10 +373,10 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-/// Runs the daemon: spawns the health HTTP server, waits for shutdown signal, then
-/// flushes the DB and drops it (triggering WAL flush and compaction stop).
+/// Runs the daemon: spawns the gRPC server and the health HTTP server, waits for shutdown signal,
+/// then flushes the DB and drops it (triggering WAL flush and compaction stop).
 async fn run_with_health_server(
-    db: DbCore,
+    db: std::sync::Arc<DbCore>,
     options: DaemonOptions,
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -302,9 +384,10 @@ async fn run_with_health_server(
         .await
         .map_err(|e| format!("failed to bind {}: {}", options.http_bind, e))?;
     eprintln!(
-        "ugnosd running (data_dir={}, http={}). Press Ctrl+C or send SIGTERM to stop.",
+        "ugnosd running (data_dir={}, http={}, grpc={}). Press Ctrl+C or send SIGTERM to stop.",
         db.get_config().data_dir.display(),
-        options.http_bind
+        options.http_bind,
+        options.grpc_bind
     );
 
     let state = std::sync::Arc::new(HealthState { ready });
@@ -355,6 +438,22 @@ async fn run_with_health_server(
     Ok(())
 }
 
+/// Serves the gRPC UgnosService on the given address. Auth layer is always applied (deny-by-default).
+async fn serve_grpc(
+    db: std::sync::Arc<DbCore>,
+    addr: SocketAddr,
+    grpc_auth: GrpcAuthConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let svc = ugnos::grpc::UgnosServiceServer::new(ugnos::grpc::UgnosServiceImpl::new(db));
+    let auth_layer = GrpcAuthLayer::new(grpc_auth);
+    tonic::transport::Server::builder()
+        .layer(auth_layer)
+        .serve(addr, svc)
+        .await
+        .map_err(|e| format!("gRPC server error: {}", e))?;
+    Ok(())
+}
+
 // ---------- Main ----------
 
 #[tokio::main]
@@ -371,6 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("enable_wal={}", db_config.enable_wal);
         println!("enable_segments={}", db_config.enable_segments);
         println!("http_bind={}", options.http_bind);
+        println!("grpc_bind={}", options.grpc_bind);
         return Ok(());
     }
 
@@ -388,6 +488,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("recovery failed: {}", e);
         e
     })?;
+
+    let db = std::sync::Arc::new(db);
+    let db_grpc = std::sync::Arc::clone(&db);
+    let grpc_addr = options.grpc_bind;
+    let grpc_auth = options.grpc_auth.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve_grpc(db_grpc, grpc_addr, grpc_auth).await {
+            eprintln!("gRPC server: {}", e);
+        }
+    });
 
     let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     run_with_health_server(db, options, ready).await

@@ -1,6 +1,6 @@
 [package]
 name = "ugnos"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.85"
 description = "A high-performance, concurrent time-series database core written in Rust, designed for efficient IoT data ingestion, real-time analytics, and monitoring."
@@ -36,9 +36,15 @@ hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "server-auto", "http1", "tokio"] }
 bytes = "1"
-# Add other dependencies as needed, e.g.:
-# log = "0.4"
-# chrono = "0.4"
+http = "1"
+tonic = "0.14.4"
+tonic-prost = "0.14"
+prost = "0.14"
+tower = "0.5"
+constant_time_eq = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [features]
 # Enable Prometheus in-process scraping by default, while allowing consumers to opt out

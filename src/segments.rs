@@ -1,9 +1,8 @@
 use crate::encoding::{
-    build_tag_block_index, crc32, decode_series_block_v1_all_rows,
-    decode_series_block_v1_for_query, decode_series_block_v2_all_rows,
-    decode_series_block_v2_for_query, encode_series_block, parse_tag_block_index, read_u32,
-    read_u64, read_var_u32, write_u32, write_u64, write_var_u32, SegmentEncodingConfig,
-    TagBlockIndex,
+    SegmentEncodingConfig, TagBlockIndex, build_tag_block_index, crc32,
+    decode_series_block_v1_all_rows, decode_series_block_v1_for_query,
+    decode_series_block_v2_all_rows, decode_series_block_v2_for_query, encode_series_block,
+    parse_tag_block_index, read_u32, read_u64, read_var_u32, write_u32, write_u64, write_var_u32,
 };
 use crate::error::DbError;
 use crate::types::{Row, TagSet, Timestamp, Value};
@@ -15,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
