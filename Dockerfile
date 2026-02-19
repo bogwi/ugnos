@@ -11,6 +11,11 @@ FROM rust:${RUST_VERSION}-bookworm AS build
 ARG BIN_NAME=ugnosd
 WORKDIR /app
 
+# build.rs compiles gRPC (tonic) and Prometheus remote-write (prost) protos; both require protoc.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy source; .dockerignore excludes target/, dev/, etc., for smaller context and cache.
 COPY . .
 

@@ -10,6 +10,24 @@ Goal: become usable as a production database via a networked server binary and s
 
 ## [Pass-through]
 
+### [0.4.4] - 2026-02-19 - HTTP ops endpoints (liveness/readiness) + Prometheus Remote Write
+
+### Added
+*Deliverables:*
+
+- Ops endpoints over HTTP (hyper): `GET /healthz` (liveness), `GET /readyz` (readiness); `HEAD` allowed; non-GET/HEAD on ops paths return 405; readiness set false on shutdown for drain; `Content-Type: text/plain; charset=utf-8`; library module `ugnos::http_ops` with `OpsState` and pure `handle_ops_request` for testability.
+- Prometheus Remote Write ingest: `POST /api/v1/write` accepts Snappy-compressed protobuf `WriteRequest`; mapping: `__name__` → series name, remaining labels → `TagSet`, sample timestamp (ms) → internal nanoseconds; invalid payloads → 400 with actionable error; cardinality limit → 429 with explicit error body and `ugnos_remote_write_rejections` (reason label); AuthN/AuthZ deny-by-default via optional `http_write_token` (config/env `UGNOS__HTTP_WRITE_TOKEN`), Bearer token required when set; library module `ugnos::remote_write` and generated `ugnos::prometheus` (prompb types).
+- Prometheus HTTP API v1 (Grafana Prometheus datasource compatibility): `GET /api/v1/query` (instant), `GET /api/v1/query_range` (range), `GET /api/v1/labels`, `GET /api/v1/label/<name>/values`, `GET /api/v1/series`; standard JSON envelope and result formats; only metric selector expressions with exact label matchers (`=`) supported; library module `ugnos::prometheus_api`; metadata endpoints use `DbCore::list_series_keys` / `list_series_names` (cardinality tracker and segment manifest).
+
+*Acceptance criteria:*
+- Invalid Remote Write payloads return 400 with actionable error.
+- Backpressure returns 429 and emits metrics (request rejected, reason).
+- Cardinality-limit rejections return explicit error semantics (documented) and emit metrics.
+- Prometheus HTTP API returns correct JSON schema for success/error responses (Grafana-compatible).
+- AuthN/AuthZ is deny-by-default and covers all **HTTP** endpoints shipped in Milestone 2 (ops + Prometheus compatibility).
+
+## [Pass-through]
+
 ### [0.4.3] - 2026-02-17 - External APIs (native)
 
 ### Added
@@ -23,12 +41,6 @@ Goal: become usable as a production database via a networked server binary and s
 - End-to-end integration tests validate ingest → persist → restart → query.
 - Backpressure behavior is well-defined (429/RESOURCE_EXHAUSTED) with metrics.
 - AuthN/AuthZ is deny-by-default and covers all **gRPC** endpoints shipped in Milestone 2.
-
-*Assertions (implemented):*
-
-- `tests/grpc_integration_tests.rs`: `ingest_persist_restart_query_via_grpc` (write 3 pts → flush → drop → recover → query = 3 pts with correct values).
-- `src/grpc/service.rs`: `Write` fails fast on `SeriesCardinalityLimitExceeded` with `RESOURCE_EXHAUSTED`; `db_error_to_status` maps all backpressure errors; `ugnos_cardinality_limit_rejections` counter + `ugnos_series_cardinality` gauge (DB level); `ugnos_grpc_requests` counter + `ugnos_grpc_request_duration_seconds` histogram with method/code labels (gRPC level); integration tests: `grpc_write_cardinality_limit_returns_resource_exhausted`, `grpc_write_cardinality_mid_batch_reports_progress`, `grpc_write_existing_series_after_limit_succeeds`.
-- `src/grpc/auth.rs`: `GrpcAuthLayer` (Tower); deny-by-default (empty config denies all); `required_for_path` maps all 5 RPCs; constant-time token comparison; 401 (no/bad token) / 403 (missing permission) / deny unknown paths; integration tests: `grpc_auth_no_token_returns_unauthenticated`, `grpc_auth_wrong_token_returns_unauthenticated`, `grpc_auth_valid_token_missing_permission_returns_permission_denied`, `grpc_auth_valid_token_with_permission_succeeds`, `grpc_auth_empty_config_denies_all`, `grpc_auth_bearer_token_accepted`, `grpc_auth_compact_with_valid_token_succeeds`, `grpc_auth_compact_without_admin_denied`.
 
 ### Changed
 - Change in `ci.yml`: On main we only save (no restore), so we never save the same key we restored. On branches/PRs we restore to compare against baseline.

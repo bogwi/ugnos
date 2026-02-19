@@ -327,6 +327,23 @@ impl SegmentStore {
             .unwrap_or(0)
     }
 
+    /// Returns all series names present in active segments (for Prometheus API metadata).
+    pub fn list_series_names(&self) -> Vec<String> {
+        let st = match self.state.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for seg in &st.active {
+            for name in seg.rec.series.keys() {
+                names.insert(name.clone());
+            }
+        }
+        let mut out: Vec<String> = names.into_iter().collect();
+        out.sort();
+        out
+    }
+
     pub(crate) fn ingest_l0(
         &self,
         mut rows_by_series: HashMap<String, Vec<Row>>,

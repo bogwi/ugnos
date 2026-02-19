@@ -938,6 +938,40 @@ impl DbCore {
         Ok(())
     }
 
+    /// Returns all known series keys `(series_name, tag_set)` in the default scope.
+    ///
+    /// Used by Prometheus API metadata endpoints. When segment store is used without
+    /// cardinality limits, the set is populated only by inserts in this process.
+    pub fn list_series_keys(&self) -> Vec<(String, TagSet)> {
+        let scope = self
+            .config
+            .cardinality_scope_tag_key
+            .as_deref()
+            .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
+        self.cardinality
+            .list_series_keys(scope)
+            .into_iter()
+            .map(|k| (k.series_name().to_string(), k.to_tag_set()))
+            .collect()
+    }
+
+    /// Returns all series names present in the store (for Prometheus `__name__` label values).
+    ///
+    /// When segment store is enabled, names are collected from segment manifests; otherwise
+    /// from in-memory storage.
+    pub fn list_series_names(&self) -> Vec<String> {
+        if let Some(store) = &self.segment_store {
+            return store.list_series_names();
+        }
+        let guard = match self.storage.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut names: Vec<String> = guard.get_all_series().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Returns a reference to the current database configuration.
     ///
     /// This allows inspection of the configuration used to initialize the database.

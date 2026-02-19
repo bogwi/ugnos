@@ -90,6 +90,9 @@ pub mod db_metrics {
     /// gRPC request processing duration histogram (labels: method).
     pub const GRPC_REQUEST_DURATION_SECONDS: &str = "ugnos_grpc_request_duration_seconds";
 
+    /// Remote write rejections (labels: reason). Emitted when POST /api/v1/write returns 429 or 400.
+    pub const REMOTE_WRITE_REJECTIONS: &str = "ugnos_remote_write_rejections";
+
     /// Handle to the in-process Prometheus recorder/scrape renderer.
     ///
     /// This does **not** start an HTTP server. Call [`InProcessPrometheus::render`] to scrape.
@@ -232,6 +235,12 @@ pub mod db_metrics {
         ::metrics::counter!(TAG_POSTINGS_SEGMENT_SKIPS).increment(1);
     }
 
+    /// Records a remote write request rejection (400 invalid payload, 429 cardinality/backpressure).
+    #[inline]
+    pub fn record_remote_write_rejected(reason: &str) {
+        ::metrics::counter!(REMOTE_WRITE_REJECTIONS, "reason" => reason.to_string()).increment(1);
+    }
+
     /// Records a gRPC request completion with method name, elapsed duration, and gRPC status code.
     #[inline]
     pub fn record_grpc_request(method: &str, duration: Duration, grpc_code: &str) {
@@ -318,6 +327,11 @@ pub mod db_metrics {
             GRPC_REQUEST_DURATION_SECONDS,
             Unit::Seconds,
             "gRPC request processing duration by method."
+        );
+        describe_counter!(
+            REMOTE_WRITE_REJECTIONS,
+            Unit::Count,
+            "Remote write (POST /api/v1/write) requests rejected, labelled by reason (invalid_payload, cardinality_limit)."
         );
     }
 }

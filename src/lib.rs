@@ -17,6 +17,21 @@ pub mod utils;
 /// gRPC (Tonic) API for ingest, query, and administration.
 pub mod grpc;
 
+/// HTTP ops endpoints (liveness/readiness) for hyper.
+pub mod http_ops;
+
+/// Prometheus Remote Write ingest: decode Snappy-compressed WriteRequest and map to DbCore inserts.
+pub mod remote_write;
+
+/// Prometheus HTTP API v1 (query, query_range, labels, label values, series) for Grafana compatibility.
+pub mod prometheus_api;
+
+/// Generated Prometheus prompb types (WriteRequest, TimeSeries, Sample, Label).
+pub mod prometheus {
+    #![allow(clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
+}
+
 /// Configuration options for the database core.
 pub use crate::core::DbConfig;
 /// Main entry point for interacting with the time-series database core.

@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use std::convert::Infallible;
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use clap::Parser;
+use http::StatusCode;
 use config::{Config, Environment, File};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -22,6 +22,9 @@ use hyper_util::server::graceful::GracefulShutdown;
 use std::collections::HashSet;
 use ugnos::encoding::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
 use ugnos::grpc::{GrpcAuthConfig, GrpcAuthKey, GrpcAuthLayer, GrpcPermission};
+use ugnos::http_ops;
+use ugnos::prometheus_api;
+use ugnos::remote_write;
 use ugnos::telemetry::noop_event_listener;
 use ugnos::{DbConfig, DbCore};
 
@@ -156,9 +159,13 @@ pub struct DaemonFileConfig {
     pub segment_store: Option<SegmentStoreFileConfig>,
     #[serde(rename = "grpc_auth")]
     pub grpc_auth: Option<GrpcAuthFileConfig>,
+    /// Bearer token required for POST /api/v1/write (Prometheus remote write). Deny-by-default: if unset, remote write returns 401.
+    pub http_write_token: Option<String>,
+    /// Bearer token required for GET/POST /api/v1/* (Prometheus read API). Deny-by-default: if unset, all read API requests return 401.
+    pub http_read_token: Option<String>,
 }
 
-/// Runtime options for the daemon (HTTP and gRPC bind, gRPC auth) derived from config + env + CLI.
+/// Runtime options for the daemon (HTTP and gRPC bind, gRPC auth, HTTP write auth) derived from config + env + CLI.
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     /// Address to bind the HTTP health/readiness server.
@@ -167,6 +174,10 @@ pub struct DaemonOptions {
     pub grpc_bind: SocketAddr,
     /// gRPC AuthN/AuthZ config. Deny-by-default: empty keys ⇒ all gRPC requests denied.
     pub grpc_auth: GrpcAuthConfig,
+    /// If set, POST /api/v1/write requires Authorization: Bearer <this token>. If unset, remote write returns 401 (deny-by-default).
+    pub http_write_token: Option<String>,
+    /// If set, GET/POST /api/v1/* (Prometheus read API) requires Authorization: Bearer <this token>. If unset, returns 401 (deny-by-default).
+    pub http_read_token: Option<String>,
 }
 
 impl Default for DaemonOptions {
@@ -175,6 +186,8 @@ impl Default for DaemonOptions {
             http_bind: "127.0.0.1:8080".parse().expect("default http_bind"),
             grpc_bind: "127.0.0.1:50051".parse().expect("default grpc_bind"),
             grpc_auth: GrpcAuthConfig::default(),
+            http_write_token: None,
+            http_read_token: None,
         }
     }
 }
@@ -236,10 +249,14 @@ fn load_daemon_config(cli: &Cli) -> Result<(DbConfig, DaemonOptions), String> {
     let grpc_bind = parse_bind_addr(grpc_bind_str, "grpc_bind")?;
 
     let grpc_auth = grpc_auth_config_from_file(&partial.grpc_auth);
+    let http_write_token = partial.http_write_token;
+    let http_read_token = partial.http_read_token;
     let options = DaemonOptions {
         http_bind,
         grpc_bind,
         grpc_auth,
+        http_write_token,
+        http_read_token,
     };
     Ok((db_config, options))
 }
@@ -320,38 +337,250 @@ fn check_data_dir_writable(data_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- Health HTTP server ----------
+// ---------- HTTP server (ops + Prometheus remote write) ----------
 
-/// Shared state for the health service (readiness flag only).
-struct HealthState {
-    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+/// Shared state for the combined HTTP handler (ops + POST /api/v1/write).
+struct HttpState {
+    ops: std::sync::Arc<http_ops::OpsState>,
+    db: std::sync::Arc<DbCore>,
+    /// If set, POST /api/v1/write requires Authorization: Bearer <token>. If unset, remote write returns 401.
+    http_write_token: Option<String>,
+    /// If set, GET/POST /api/v1/* (Prometheus read API) requires Authorization: Bearer <token>. If unset, returns 401.
+    http_read_token: Option<String>,
 }
 
-async fn health_service(
-    state: std::sync::Arc<HealthState>,
+fn check_bearer(headers: &http::HeaderMap, expected: &str) -> bool {
+    let auth = match headers.get(http::header::AUTHORIZATION) {
+        Some(v) => v,
+        None => return false,
+    };
+    let prefix = b"Bearer ";
+    let bytes = auth.as_bytes();
+    if bytes.len() < prefix.len() {
+        return false;
+    }
+    let (head, rest) = bytes.split_at(prefix.len());
+    if head != prefix {
+        return false;
+    }
+    constant_time_eq::constant_time_eq(rest, expected.as_bytes())
+}
+
+/// Parse a `key=value&key=value` parameter string (URL query or form-encoded body).
+fn parse_params_str(q: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for pair in q.split('&') {
+        let (k, v) = match pair.find('=') {
+            Some(i) => {
+                let k = urlencoding::decode(pair[..i].trim()).unwrap_or_default();
+                let v = urlencoding::decode(pair[i + 1..].trim()).unwrap_or_default();
+                (k.into_owned(), v.into_owned())
+            }
+            None => continue,
+        };
+        if !k.is_empty() {
+            out.entry(k).or_default().push(v);
+        }
+    }
+    out
+}
+
+/// Parse URI query string into key -> list of values (for match[] etc.).
+fn query_params(uri: &http::Uri) -> std::collections::HashMap<String, Vec<String>> {
+    match uri.query() {
+        Some(q) => parse_params_str(q),
+        None => std::collections::HashMap::new(),
+    }
+}
+
+fn first_param(params: &std::collections::HashMap<String, Vec<String>>, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.first()).cloned()
+}
+
+/// Prometheus JSON error response in the standard envelope format (`{"status":"error",...}`).
+fn prom_json_error(status: StatusCode, error_type: &str, error: &str) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "status": "error",
+        "errorType": error_type,
+        "error": error,
+    });
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+        .body(Full::new(Bytes::from(serde_json::to_vec(&body).expect("serialize error"))))
+        .expect("response build")
+}
+
+async fn http_service(
+    state: std::sync::Arc<HttpState>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (status, body) = match (req.method(), req.uri().path()) {
-        (&hyper::Method::GET, "/healthz") => {
-            // Liveness: process is alive and responding.
-            (hyper::StatusCode::OK, Bytes::from("ok"))
-        }
-        (&hyper::Method::GET, "/readyz") => {
-            // Readiness: DB opened and recovered; safe to send traffic.
-            if state.ready.load(Ordering::Acquire) {
-                (hyper::StatusCode::OK, Bytes::from("ok"))
-            } else {
-                (
-                    hyper::StatusCode::SERVICE_UNAVAILABLE,
-                    Bytes::from("not ready"),
-                )
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let raw_path = uri.path();
+    let path = raw_path.trim_matches('/');
+
+    let is_get = method == http::Method::GET;
+    let is_post = method == http::Method::POST;
+
+    // --- Remote write (POST /api/v1/write) --- auth via http_write_token, deny-by-default
+    if is_post && path == "api/v1/write" {
+        let expected = match &state.http_write_token {
+            Some(t) => t.as_str(),
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Full::new(Bytes::from("remote write: auth required (configure http_write_token)")))
+                    .expect("response build"));
             }
+        };
+        if !check_bearer(req.headers(), expected) {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Full::new(Bytes::from("remote write: unauthorized")))
+                .expect("response build"));
         }
-        _ => (hyper::StatusCode::NOT_FOUND, Bytes::from("not found")),
-    };
+        let body = match req.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Full::new(Bytes::from(format!("failed to read body: {}", e))))
+                    .expect("response build"));
+            }
+        };
+        let r = remote_write::handle_remote_write(&body, &state.db);
+        return Ok(Response::builder()
+            .status(r.status)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from(r.body)))
+            .expect("response build"));
+    }
+
+    // --- Prometheus read API (GET/POST /api/v1/*) --- auth via http_read_token, deny-by-default
+    if (is_get || is_post) && path.starts_with("api/v1/") {
+        let expected = match &state.http_read_token {
+            Some(t) => t.as_str(),
+            None => {
+                return Ok(prom_json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "auth",
+                    "authentication required (configure http_read_token)",
+                ));
+            }
+        };
+        if !check_bearer(req.headers(), expected) {
+            return Ok(prom_json_error(
+                StatusCode::UNAUTHORIZED,
+                "auth",
+                "unauthorized",
+            ));
+        }
+
+        // GET: URL query params. POST: merge URL params with form-encoded body (Grafana compat).
+        let params = if is_post {
+            match req.into_body().collect().await {
+                Ok(collected) => {
+                    let mut merged = query_params(&uri);
+                    for (k, vs) in parse_params_str(&String::from_utf8_lossy(&collected.to_bytes())) {
+                        merged.entry(k).or_default().extend(vs);
+                    }
+                    merged
+                }
+                Err(e) => {
+                    return Ok(prom_json_error(
+                        StatusCode::BAD_REQUEST,
+                        "bad_data",
+                        &format!("failed to read body: {}", e),
+                    ));
+                }
+            }
+        } else {
+            query_params(&uri)
+        };
+
+        let sub = path.strip_prefix("api/v1/").unwrap_or(path);
+        if sub == "query" {
+            let r = prometheus_api::handle_query(
+                first_param(&params, "query").as_deref(),
+                first_param(&params, "time").as_deref(),
+                &state.db,
+            );
+            return Ok(Response::builder()
+                .status(r.status)
+                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .body(Full::new(Bytes::from(r.body)))
+                .expect("response build"));
+        }
+        if sub == "query_range" {
+            let r = prometheus_api::handle_query_range(
+                first_param(&params, "query").as_deref(),
+                first_param(&params, "start").as_deref(),
+                first_param(&params, "end").as_deref(),
+                first_param(&params, "step").as_deref(),
+                &state.db,
+            );
+            return Ok(Response::builder()
+                .status(r.status)
+                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .body(Full::new(Bytes::from(r.body)))
+                .expect("response build"));
+        }
+        if sub == "labels" {
+            let r = prometheus_api::handle_labels(&state.db);
+            return Ok(Response::builder()
+                .status(r.status)
+                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .body(Full::new(Bytes::from(r.body)))
+                .expect("response build"));
+        }
+        if sub.starts_with("label/") && sub.ends_with("/values") {
+            let name = sub
+                .strip_prefix("label/")
+                .and_then(|s| s.strip_suffix("/values"))
+                .unwrap_or("");
+            let r = prometheus_api::handle_label_values(name, &state.db);
+            return Ok(Response::builder()
+                .status(r.status)
+                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .body(Full::new(Bytes::from(r.body)))
+                .expect("response build"));
+        }
+        if sub == "series" {
+            let match_list: Vec<String> = params
+                .get("match[]")
+                .cloned()
+                .unwrap_or_default();
+            let r = prometheus_api::handle_series(
+                &match_list,
+                first_param(&params, "start").as_deref(),
+                first_param(&params, "end").as_deref(),
+                &state.db,
+            );
+            return Ok(Response::builder()
+                .status(r.status)
+                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .body(Full::new(Bytes::from(r.body)))
+                .expect("response build"));
+        }
+
+        return Ok(prom_json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("unknown API path: /api/v1/{}", sub),
+        ));
+    }
+
+    // --- Ops endpoints (no auth – infrastructure probes for Kubernetes liveness/readiness) ---
+    let response = http_ops::handle_ops_request(&method, raw_path, state.ops.is_ready());
     Ok(Response::builder()
-        .status(status)
-        .body(Full::new(body))
+        .status(response.status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(response.body)))
         .expect("response build"))
 }
 
@@ -373,12 +602,13 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-/// Runs the daemon: spawns the gRPC server and the health HTTP server, waits for shutdown signal,
+/// Runs the daemon: spawns the gRPC server and the ops HTTP server, waits for shutdown signal,
 /// then flushes the DB and drops it (triggering WAL flush and compaction stop).
+/// On shutdown, readiness is set to false so /readyz returns 503 and orchestrators drain traffic.
 async fn run_with_health_server(
     db: std::sync::Arc<DbCore>,
     options: DaemonOptions,
-    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ops_state: std::sync::Arc<http_ops::OpsState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(options.http_bind)
         .await
@@ -390,29 +620,36 @@ async fn run_with_health_server(
         options.grpc_bind
     );
 
-    let state = std::sync::Arc::new(HealthState { ready });
     let server = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown_signal());
+
+    let http_state = std::sync::Arc::new(HttpState {
+        ops: ops_state.clone(),
+        db: db.clone(),
+        http_write_token: options.http_write_token.clone(),
+        http_read_token: options.http_read_token.clone(),
+    });
 
     loop {
         tokio::select! {
             Ok((stream, _addr)) = listener.accept() => {
                 let io = TokioIo::new(Box::pin(stream));
-                let state = std::sync::Arc::clone(&state);
+                let state = std::sync::Arc::clone(&http_state);
                 let conn = server.serve_connection_with_upgrades(io, service_fn(move |req| {
                     let state = std::sync::Arc::clone(&state);
-                    async move { health_service(state, req).await }
+                    async move { http_service(state, req).await }
                 }));
                 let fut = graceful.watch(conn.into_owned());
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {
-                        eprintln!("health connection error: {:?}", e);
+                        eprintln!("ops connection error: {:?}", e);
                     }
                 });
             }
             _ = &mut shutdown => {
                 eprintln!("shutdown signal received");
+                ops_state.set_ready(false);
                 break;
             }
         }
@@ -499,6 +736,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    run_with_health_server(db, options, ready).await
+    let ops_state = std::sync::Arc::new(http_ops::OpsState::new(true));
+    run_with_health_server(db, options, ops_state).await
 }
