@@ -8,14 +8,15 @@ use tempfile::TempDir;
 use ugnos::{DbConfig, DbCore, DbError, TagSet};
 
 fn make_segments_cfg(dir: &std::path::Path, max_cardinality: Option<u64>) -> DbConfig {
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(3600);
-    cfg.max_series_cardinality = max_cardinality;
-    cfg
+    DbConfig {
+        data_dir: dir.to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(3600),
+        max_series_cardinality: max_cardinality,
+        ..Default::default()
+    }
 }
 
 fn tags(pairs: &[(&str, &str)]) -> TagSet {

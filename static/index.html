@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ugnos</title>
+  <style>
+    :root {
+      --color-bg: #0d0d0d;
+      --color-bg-table-header: #0d0d0d;
+      --color-bg-table-cell: #0a0a0a;
+      --color-bg-code: #3d3534;
+      --color-text: #8d8d8d;
+      --color-text-muted: #21cde0d5;
+      --color-text-code: #22f0f0e3;
+      --color-border: #121212;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      font-size: 1rem;
+      line-height: 1.5;
+      color: var(--color-text);
+      background: var(--color-bg);
+      padding: 2rem;
+      font-family: monospace;
+    }
+    main {
+      max-width: 36rem;
+      width: 100%;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 1.5rem;
+      color: var(--color-text-muted);
+      text-align: left;
+    }
+    p { margin: 0 0 1rem; }
+    .version {
+      /* text-align: center; */
+      margin-bottom: 1.5rem;
+      font-size: 0.875rem;
+      color: var(--color-text-muted);
+    }
+    .version strong { color: var(--color-text); }
+    section {
+      margin-bottom: 1.5rem;
+    }
+    section h2 {
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--color-text-muted);
+      margin: 0 0 0.5rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.35rem 0.5rem;
+      border: 1px solid var(--color-border);
+    }
+    th {
+      font-weight: 600;
+      color: var(--color-text-muted);
+      background: var(--color-bg-table-header);
+    }
+    td { background: var(--color-bg-table-cell); }
+    code {
+      font-size: 0.875em;
+      background: var(--color-bg-code);
+      color: var(--color-text-code);
+      padding: 0.1em 0.35em;
+      border-radius: 3px;
+    }
+    a {
+      color: var(--color-text-code);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+    .links {
+      /* text-align: center; */
+      margin-top: 1.5rem;
+      font-size: 0.875rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>This is Ugnos, a time-series database for the next decade's high-throughput workloads.</h1>
+    <p class="version">Version <strong>{{VERSION}}</strong> &nbsp;|&nbsp; <span class="links"><a href="https://github.com/bogwi/ugnos">GitHub</a></span></p>
+
+    <section>
+      <h2>HTTP API</h2>
+      <table>
+        <thead>
+          <tr><th>Method</th><th>Path</th><th>Auth</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>GET, HEAD</td><td>/healthz</td><td>none</td><td>Liveness</td></tr>
+          <tr><td>GET, HEAD</td><td>/readyz</td><td>none</td><td>Readiness</td></tr>
+          <tr><td>POST</td><td>/api/v1/write</td><td>Bearer (if http_write_token set)</td><td>Prometheus Remote Write</td></tr>
+          <tr><td>GET, POST</td><td>/api/v1/query</td><td>Bearer (if http_read_token set)</td><td>Instant query (PromQL-like)</td></tr>
+          <tr><td>GET, POST</td><td>/api/v1/query_range</td><td>same</td><td>Range query</td></tr>
+          <tr><td>GET</td><td>/api/v1/labels</td><td>same</td><td>List label names</td></tr>
+          <tr><td>GET</td><td>/api/v1/label/&lt;name&gt;/values</td><td>same</td><td>List values for a label</td></tr>
+          <tr><td>GET</td><td>/api/v1/series</td><td>same</td><td>Series matching match[]</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>gRPC</h2>
+      <p>Default port 50051. <code>UgnosService</code>: Write, Query, Flush, Compact, Status. Auth deny-by-default when configured.</p>
+    </section>
+
+  </main>
+</body>
+</html>

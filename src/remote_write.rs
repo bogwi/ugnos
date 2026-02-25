@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
+use crate::DbCore;
 use crate::error::DbError;
 use crate::prometheus;
 use crate::telemetry::db_metrics;
 use crate::types::{TagSet, Timestamp};
-use crate::DbCore;
 use http::StatusCode;
 use prost::Message;
 
@@ -154,9 +154,9 @@ pub fn handle_remote_write(body: &[u8], db: &Arc<DbCore>) -> RemoteWriteResponse
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_remote_write, series_and_tags, ms_to_ns};
-    use crate::prometheus::{Label, Sample, TimeSeries, WriteRequest};
+    use super::{handle_remote_write, ms_to_ns, series_and_tags};
     use crate::DbCore;
+    use crate::prometheus::{Label, Sample, TimeSeries, WriteRequest};
     use prost::Message;
     use std::sync::Arc;
 
@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(name, "http_requests_total");
         assert_eq!(tags.get("job"), Some(&"api".to_string()));
         assert_eq!(tags.get("method"), Some(&"GET".to_string()));
-        assert!(tags.get("__name__").is_none());
+        assert!(!tags.contains_key("__name__"));
     }
 
     #[test]
@@ -248,8 +248,10 @@ mod tests {
     #[test]
     fn handle_remote_write_invalid_snappy_returns_400() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::DbConfig::default();
-        config.data_dir = dir.path().to_path_buf();
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let db = Arc::new(DbCore::with_config(config).unwrap());
         let r = handle_remote_write(b"not snappy", &db);
         assert_eq!(r.status, http::StatusCode::BAD_REQUEST);
@@ -259,8 +261,10 @@ mod tests {
     #[test]
     fn handle_remote_write_valid_ingests_points() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::DbConfig::default();
-        config.data_dir = dir.path().to_path_buf();
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let mut db = DbCore::with_config(config).unwrap();
         db.recover().unwrap();
         let db = Arc::new(db);
@@ -298,9 +302,7 @@ mod tests {
         assert!(r.body.starts_with(b"ok points=2"));
 
         db.flush().unwrap();
-        let points = db
-            .query("metric_a", 0..u64::MAX, None)
-            .unwrap();
+        let points = db.query("metric_a", 0..u64::MAX, None).unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0], (1_000_000_000, 42.5));
         assert_eq!(points[1], (2_000_000_000, 43.0));
@@ -309,8 +311,10 @@ mod tests {
     #[test]
     fn handle_remote_write_missing_name_returns_400() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::DbConfig::default();
-        config.data_dir = dir.path().to_path_buf();
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let db = Arc::new(DbCore::with_config(config).unwrap());
         let wr = WriteRequest {
             timeseries: vec![TimeSeries {
@@ -340,9 +344,11 @@ mod tests {
     #[test]
     fn handle_remote_write_cardinality_limit_returns_429() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::DbConfig::default();
-        config.data_dir = dir.path().to_path_buf();
-        config.max_series_cardinality = Some(1);
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_series_cardinality: Some(1),
+            ..Default::default()
+        };
         let mut db = DbCore::with_config(config).unwrap();
         db.recover().unwrap();
         let db = Arc::new(db);

@@ -233,7 +233,7 @@ impl UgnosServiceTrait for UgnosServiceImpl {
         let started = Instant::now();
         let config = self.db.get_config();
         // Segment count is not exposed on DbCore; report 0 when segments are enabled.
-        let segment_count: u32 = if config.enable_segments { 0 } else { 0 };
+        let segment_count: u32 = 0;
 
         record_and_return(
             "Status",

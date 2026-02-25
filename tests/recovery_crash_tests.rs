@@ -27,13 +27,15 @@ fn test_recovery_after_crash_wal_append() {
     }
 
     // Restart and recover from WAL.
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = data_dir;
-    cfg.enable_wal = true;
-    cfg.enable_snapshots = false;
-    cfg.enable_segments = false;
-    cfg.flush_interval = Duration::from_secs(3600);
-    cfg.wal_buffer_size = 1;
+    let cfg = DbConfig {
+        data_dir,
+        enable_wal: true,
+        enable_snapshots: false,
+        enable_segments: false,
+        flush_interval: Duration::from_secs(3600),
+        wal_buffer_size: 1,
+        ..Default::default()
+    };
 
     let mut db = DbCore::with_config(cfg).unwrap();
     db.recover().unwrap();
@@ -65,13 +67,15 @@ fn test_recovery_after_crash_during_flush_wal_rotated_segments_enabled() {
     }
 
     // Restart with segments enabled: recovery must materialize WAL tail into a new L0 segment.
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = data_dir.clone();
-    cfg.enable_wal = true;
-    cfg.enable_snapshots = false;
-    cfg.enable_segments = true;
-    cfg.flush_interval = Duration::from_secs(3600);
-    cfg.wal_buffer_size = 1;
+    let cfg = DbConfig {
+        data_dir: data_dir.clone(),
+        enable_wal: true,
+        enable_snapshots: false,
+        enable_segments: true,
+        flush_interval: Duration::from_secs(3600),
+        wal_buffer_size: 1,
+        ..Default::default()
+    };
 
     let mut db = DbCore::with_config(cfg.clone()).unwrap();
     db.recover().unwrap();
@@ -130,12 +134,14 @@ fn test_recovery_after_crash_during_snapshot_write_tmp_is_ignored() {
     }
 
     // DB recovery should ignore tmp files and load the valid snapshot.
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = data_dir;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = true;
-    cfg.enable_segments = false;
-    cfg.flush_interval = Duration::from_secs(3600);
+    let cfg = DbConfig {
+        data_dir,
+        enable_wal: false,
+        enable_snapshots: true,
+        enable_segments: false,
+        flush_interval: Duration::from_secs(3600),
+        ..Default::default()
+    };
 
     let mut db = DbCore::with_config(cfg).unwrap();
     db.recover().unwrap();
@@ -161,6 +167,7 @@ fn test_wal_corruption_is_detected_with_series_and_timestamp_context() {
         let mut wal = WriteAheadLog::new(&wal_dir, 1).unwrap();
         let mut tags = TagSet::new();
         tags.insert("k".to_string(), "v".to_string());
+        #[allow(clippy::approx_constant)]
         wal.log_insert(1, series, ts, 3.14, tags).unwrap();
         wal.flush_to_disk().unwrap();
     }

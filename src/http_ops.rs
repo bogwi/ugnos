@@ -117,7 +117,7 @@ pub fn handle_ops_request(method: &http::Method, path: &str, ready: bool) -> Ops
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_ops_request, OpsResponse, OpsState};
+    use super::{OpsResponse, OpsState, handle_ops_request};
     use http::Method;
     use http::StatusCode;
 

@@ -8,6 +8,8 @@ pub mod error;
 pub mod index;
 pub mod persistence;
 pub mod query;
+/// Stable PromQL-like query surface (label matchers =, !=, =~, !~) for Grafana compatibility.
+pub mod query_surface;
 pub mod segments;
 pub mod storage;
 pub mod telemetry;

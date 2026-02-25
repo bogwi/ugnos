@@ -9,10 +9,12 @@ use ugnos::encoding::{BlockCompression, FloatEncoding};
 use ugnos::{DbConfig, DbCore, DbError, TagSet};
 
 fn main() -> Result<(), DbError> {
-    let mut config = DbConfig::default();
-    config.data_dir = PathBuf::from("./demo_encoding_data");
-    config.enable_segments = true;
-    config.flush_interval = Duration::from_millis(50);
+    let mut config = DbConfig {
+        data_dir: PathBuf::from("./demo_encoding_data"),
+        enable_segments: true,
+        flush_interval: Duration::from_millis(50),
+        ..Default::default()
+    };
     config.segment_store.encoding.float_encoding = FloatEncoding::GorillaXor;
     config.segment_store.encoding.compression = BlockCompression::Zstd { level: 3 };
 

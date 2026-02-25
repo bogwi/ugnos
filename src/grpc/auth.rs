@@ -91,7 +91,7 @@ impl GrpcAuthConfig {
 /// Extracts the API token from gRPC metadata (headers). Supports:
 /// - `authorization: Bearer <token>`
 /// - `x-api-key: <token>`
-/// Returns None if missing or invalid format.
+///   Returns None if missing or invalid format.
 fn extract_token_from_headers(headers: &http::HeaderMap) -> Option<Vec<u8>> {
     if let Some(v) = headers.get("x-api-key") {
         if let Ok(s) = v.to_str() {

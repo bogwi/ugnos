@@ -74,14 +74,16 @@ fn cardinality_limit_rejection_emits_explicit_error_and_metrics() {
         parse_gauge_with_scope(&before, "ugnos_series_cardinality", scope).unwrap_or(0.0);
 
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
-    cfg.max_series_cardinality = Some(2);
-    cfg.cardinality_scope_tag_key = Some("tenant".to_string());
+    let cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        max_series_cardinality: Some(2),
+        cardinality_scope_tag_key: Some("tenant".to_string()),
+        ..Default::default()
+    };
 
     let db = DbCore::with_config(cfg).expect("db init");
 

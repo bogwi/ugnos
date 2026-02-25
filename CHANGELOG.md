@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # Milestone 2 — Query engine + APIs
 Goal: become usable as a production database via a networked server binary and stable client surface.
 
+## [Released]
+
+### [0.5.0] - 2026-02-25 - Query Language
+
+### Added
+*Deliverables:*
+- A stable query surface, **PromQL-like**, for metrics-focused deployments (Grafana-compatible over Prometheus HTTP API).
+- Vectorized execution for scans/aggregations; parallelism controls.
+- Home page with HTTP API documentation and version.
+- Educational examples and scripts: `prometheus_api_client_demo.rs`, `gen_minimal_write_request.rs`, `verify-http-auth.sh`, `verify-remote-write-query.sh`, `run-prometheus-api-client-demo.sh`, `run-prometheus-api-client-demo.sh`, `verify-http-auth.sh`, `verify-remote-write-query.sh`.
+
+
+*Acceptance criteria:*
+- Query planner produces explain output; regression suite covers semantics.
+- Window aggregates and downsampling work and are tested.
+- PromQL-like regression suite covers a representative dashboard subset:
+  - vector selector with label matchers (`=`, `!=`, `=~`, `!~`)
+  - range selectors with core functions (`rate`, `increase`, `avg_over_time`, `max_over_time`, …)
+  - aggregation with grouping (`sum by (...)`, `avg without (...)`)
+- PromQL is defined to follow IEEE 754 for aggregation and operators (NaN propagates).
+  - sum / avg / count: No NaN-skipping; any NaN propagates (sum “same as +”, avg “same as /”)
+  - min / max: “NaN is only ever considered a minimum or maximum if all aggregated values are NaN” (minNum/maxNum). So we do not need NaN-skipping; the spec is “no filter, IEEE 754, min/max special case”.
+
 ## [Pass-through]
 
 ### [0.4.4] - 2026-02-19 - HTTP ops endpoints (liveness/readiness) + Prometheus Remote Write
@@ -17,7 +40,9 @@ Goal: become usable as a production database via a networked server binary and s
 
 - Ops endpoints over HTTP (hyper): `GET /healthz` (liveness), `GET /readyz` (readiness); `HEAD` allowed; non-GET/HEAD on ops paths return 405; readiness set false on shutdown for drain; `Content-Type: text/plain; charset=utf-8`; library module `ugnos::http_ops` with `OpsState` and pure `handle_ops_request` for testability.
 - Prometheus Remote Write ingest: `POST /api/v1/write` accepts Snappy-compressed protobuf `WriteRequest`; mapping: `__name__` → series name, remaining labels → `TagSet`, sample timestamp (ms) → internal nanoseconds; invalid payloads → 400 with actionable error; cardinality limit → 429 with explicit error body and `ugnos_remote_write_rejections` (reason label); AuthN/AuthZ deny-by-default via optional `http_write_token` (config/env `UGNOS__HTTP_WRITE_TOKEN`), Bearer token required when set; library module `ugnos::remote_write` and generated `ugnos::prometheus` (prompb types).
-- Prometheus HTTP API v1 (Grafana Prometheus datasource compatibility): `GET /api/v1/query` (instant), `GET /api/v1/query_range` (range), `GET /api/v1/labels`, `GET /api/v1/label/<name>/values`, `GET /api/v1/series`; standard JSON envelope and result formats; only metric selector expressions with exact label matchers (`=`) supported; library module `ugnos::prometheus_api`; metadata endpoints use `DbCore::list_series_keys` / `list_series_names` (cardinality tracker and segment manifest).
+- Prometheus HTTP API v1 (Grafana Prometheus datasource compatibility): `GET /api/v1/query` (instant), `GET /api/v1/query_range` (range), `GET /api/v1/labels`, `GET /api/v1/label/<name>/values`, `GET /api/v1/series`; standard JSON envelope and result formats; library module `ugnos::prometheus_api`; metadata endpoints use `DbCore::list_series_keys` / `list_series_names` (cardinality tracker and segment manifest).
+- **Stable query surface (PromQL-like, Grafana-compatible):** Module `ugnos::query_surface` defines the supported PromQL subset. Full evaluation expression tree (`EvalExpr`) covering instant vector selectors, range functions, and aggregations. Parsing uses `promql-parser` crate (not hand-rolled). Instant vector selectors with full label matchers: `=`, `!=`, `=~`, `!~` (exact, not-equal, regex, negated regex); optional `offset <duration>`; metric name via identifier or `{__name__=~"..."}`. Range functions: `rate()`, `increase()`, `avg_over_time()`, `max_over_time()`, `min_over_time()`, `sum_over_time()` with counter-reset handling. Aggregations: `sum`, `avg`, `min`, `max`, `count` with `by (label, ...)` / `without (label, ...)` grouping. Composable: `sum by (job) (rate(metric[5m]))`. Query planner produces `explain()` output for plan inspection and regression testing. Unsupported expressions (binary ops, subqueries) return 422 with actionable error. Semantics follow Prometheus (e.g. missing label matches `!=` and `!~`).
+- **Vectorized execution and parallelism controls:** Multi-series scans for Prometheus API (`/api/v1/query`, `/api/v1/query_range`) run in parallel (Rayon). Optional `DbConfig::query_max_parallel_series` caps concurrency via a dedicated thread pool; daemon config `query_max_parallel_series` and env `UGNOS__QUERY_MAX_PARALLEL_SERIES` supported. Vectorized range functions in `ugnos::query`: `compute_rate`, `compute_increase`, `compute_avg_over_time`, `compute_max_over_time`, `compute_min_over_time`, `compute_sum_over_time` operate on `&[(Timestamp, Value)]` slices with NaN skipping and counter-reset correction. Vectorized aggregates: `aggregate_sum`, `aggregate_avg`, `aggregate_min`, `aggregate_max`, `aggregate_count` over value slices (NaN skipped, ±Inf preserved for sum); `reduce_last` for instant-vector last sample. Expression evaluation engine in `prometheus_api.rs`: `eval_vector` (instant) and `eval_matrix` (range) recursively walk `EvalExpr` tree, pre-fetching data windows for range functions to avoid redundant I/O. Existing in-chunk parallel filtering in `execute_query` unchanged.
 
 *Acceptance criteria:*
 - Invalid Remote Write payloads return 400 with actionable error.
@@ -25,6 +50,9 @@ Goal: become usable as a production database via a networked server binary and s
 - Cardinality-limit rejections return explicit error semantics (documented) and emit metrics.
 - Prometheus HTTP API returns correct JSON schema for success/error responses (Grafana-compatible).
 - AuthN/AuthZ is deny-by-default and covers all **HTTP** endpoints shipped in Milestone 2 (ops + Prometheus compatibility).
+- Query planner produces explain output (`query_surface::explain`); regression suite covers semantics for all supported expression types.
+- Window aggregates (`avg_over_time`, `max_over_time`, `min_over_time`, `sum_over_time`) and downsampling (via `query_range` step interpolation) work and are tested.
+- PromQL-like regression suite covers representative dashboard subset: vector selectors with all 4 label matchers; range selectors with `rate`, `increase`, `avg_over_time`, `max_over_time`; aggregation with grouping (`sum by (...)`, `avg without (...)`, `count`, `min by`, `max by`).
 
 ## [Pass-through]
 

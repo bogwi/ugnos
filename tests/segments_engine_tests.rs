@@ -7,21 +7,22 @@ use tempfile::tempdir;
 use ugnos::{DbConfig, DbCore, TagSet, Timestamp, Value};
 
 fn make_segments_config(dir: &Path) -> DbConfig {
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = true;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(3600); // prevent background flush noise
-    cfg.wal_buffer_size = 1; // force frequent WAL flushes
-
+    let mut cfg = DbConfig {
+        data_dir: dir.to_path_buf(),
+        enable_segments: true,
+        enable_wal: true,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(3600), // prevent background flush noise
+        wal_buffer_size: 1, // force frequent WAL flushes
+        ..Default::default()
+    };
     // Make compaction eager so tests can trigger meaningful rewrites.
     cfg.segment_store.compaction_check_interval = Duration::from_millis(10);
     cfg.segment_store.l0_compaction_trigger_segment_count = 2;
     cfg
 }
 
-fn sort_results(v: &mut Vec<(Timestamp, Value)>) {
+fn sort_results(v: &mut [(Timestamp, Value)]) {
     // Project contract (README): query results are not guaranteed globally sorted across segments.
     // Tests that compare query outputs across compaction/recovery should normalize order.
     v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));

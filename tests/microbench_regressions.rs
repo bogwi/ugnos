@@ -65,12 +65,14 @@ fn microbench_ingest_throughput_guard() {
     let ops = generate_ops(points, 64, 4, 16);
 
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = false;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
+    let cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: false,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    };
 
     let db = DbCore::with_config(cfg).expect("db init");
 
@@ -102,12 +104,14 @@ fn microbench_flush_latency_guard() {
     let ops = generate_ops(points, 64, 4, 16);
 
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = false;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
+    let cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: false,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    };
 
     let db = DbCore::with_config(cfg).expect("db init");
     for op in ops {

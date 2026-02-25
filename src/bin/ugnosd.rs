@@ -12,8 +12,8 @@ use std::convert::Infallible;
 
 use bytes::Bytes;
 use clap::Parser;
-use http::StatusCode;
 use config::{Config, Environment, File};
+use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -155,6 +155,8 @@ pub struct DaemonFileConfig {
     pub retention_check_interval_secs: Option<u64>,
     pub max_series_cardinality: Option<u64>,
     pub cardinality_scope_tag_key: Option<String>,
+    /// Max series to scan in parallel for Prometheus API queries. When set, a dedicated pool of this size is used.
+    pub query_max_parallel_series: Option<usize>,
     #[serde(rename = "segment_store")]
     pub segment_store: Option<SegmentStoreFileConfig>,
     #[serde(rename = "grpc_auth")]
@@ -226,8 +228,10 @@ fn load_daemon_config(cli: &Cli) -> Result<(DbConfig, DaemonOptions), String> {
     let merged = builder.build().map_err(|e| e.to_string())?;
     let partial: DaemonFileConfig = merged.try_deserialize().map_err(|e| e.to_string())?;
 
-    let mut db_config = DbConfig::default();
-    db_config.event_listener = noop_event_listener();
+    let mut db_config = DbConfig {
+        event_listener: noop_event_listener(),
+        ..Default::default()
+    };
     merge_into_db_config(&mut db_config, &partial)?;
 
     if let Some(ref d) = cli.data_dir {
@@ -295,6 +299,9 @@ fn merge_into_db_config(base: &mut DbConfig, partial: &DaemonFileConfig) -> Resu
     }
     if let Some(s) = &partial.cardinality_scope_tag_key {
         base.cardinality_scope_tag_key = Some(s.clone());
+    }
+    if let Some(n) = partial.query_max_parallel_series {
+        base.query_max_parallel_series = Some(n);
     }
 
     if let Some(ss) = &partial.segment_store {
@@ -368,8 +375,7 @@ fn check_bearer(headers: &http::HeaderMap, expected: &str) -> bool {
 
 /// Parse a `key=value&key=value` parameter string (URL query or form-encoded body).
 fn parse_params_str(q: &str) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for pair in q.split('&') {
         let (k, v) = match pair.find('=') {
             Some(i) => {
@@ -394,7 +400,10 @@ fn query_params(uri: &http::Uri) -> std::collections::HashMap<String, Vec<String
     }
 }
 
-fn first_param(params: &std::collections::HashMap<String, Vec<String>>, key: &str) -> Option<String> {
+fn first_param(
+    params: &std::collections::HashMap<String, Vec<String>>,
+    key: &str,
+) -> Option<String> {
     params.get(key).and_then(|v| v.first()).cloned()
 }
 
@@ -407,8 +416,13 @@ fn prom_json_error(status: StatusCode, error_type: &str, error: &str) -> Respons
     });
     Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
-        .body(Full::new(Bytes::from(serde_json::to_vec(&body).expect("serialize error"))))
+        .header(
+            http::header::CONTENT_TYPE,
+            prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+        )
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&body).expect("serialize error"),
+        )))
         .expect("response build")
 }
 
@@ -432,16 +446,20 @@ async fn http_service(
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(Full::new(Bytes::from("remote write: auth required (configure http_write_token)")))
+                    .body(Full::new(Bytes::from(
+                        "remote write: auth required. Set UGNOS__HTTP_WRITE_TOKEN or http_write_token in config, then use Authorization: Bearer <token>",
+                    )))
                     .expect("response build"));
             }
         };
         if !check_bearer(req.headers(), expected) {
-            return Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Full::new(Bytes::from("remote write: unauthorized")))
-                .expect("response build"));
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Full::new(Bytes::from(
+                        "remote write: unauthorized. Use Authorization: Bearer <token> with the configured http_write_token",
+                    )))
+                    .expect("response build"));
         }
         let body = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -449,7 +467,10 @@ async fn http_service(
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(Full::new(Bytes::from(format!("failed to read body: {}", e))))
+                    .body(Full::new(Bytes::from(format!(
+                        "failed to read body: {}",
+                        e
+                    ))))
                     .expect("response build"));
             }
         };
@@ -469,7 +490,7 @@ async fn http_service(
                 return Ok(prom_json_error(
                     StatusCode::UNAUTHORIZED,
                     "auth",
-                    "authentication required (configure http_read_token)",
+                    "authentication required. Set UGNOS__HTTP_READ_TOKEN or http_read_token in config, then use Authorization: Bearer <token>",
                 ));
             }
         };
@@ -477,7 +498,7 @@ async fn http_service(
             return Ok(prom_json_error(
                 StatusCode::UNAUTHORIZED,
                 "auth",
-                "unauthorized",
+                "unauthorized. Use Authorization: Bearer <token> with the configured http_read_token",
             ));
         }
 
@@ -486,7 +507,8 @@ async fn http_service(
             match req.into_body().collect().await {
                 Ok(collected) => {
                     let mut merged = query_params(&uri);
-                    for (k, vs) in parse_params_str(&String::from_utf8_lossy(&collected.to_bytes())) {
+                    for (k, vs) in parse_params_str(&String::from_utf8_lossy(&collected.to_bytes()))
+                    {
                         merged.entry(k).or_default().extend(vs);
                     }
                     merged
@@ -512,7 +534,10 @@ async fn http_service(
             );
             return Ok(Response::builder()
                 .status(r.status)
-                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+                )
                 .body(Full::new(Bytes::from(r.body)))
                 .expect("response build"));
         }
@@ -526,7 +551,10 @@ async fn http_service(
             );
             return Ok(Response::builder()
                 .status(r.status)
-                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+                )
                 .body(Full::new(Bytes::from(r.body)))
                 .expect("response build"));
         }
@@ -534,7 +562,10 @@ async fn http_service(
             let r = prometheus_api::handle_labels(&state.db);
             return Ok(Response::builder()
                 .status(r.status)
-                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+                )
                 .body(Full::new(Bytes::from(r.body)))
                 .expect("response build"));
         }
@@ -546,15 +577,15 @@ async fn http_service(
             let r = prometheus_api::handle_label_values(name, &state.db);
             return Ok(Response::builder()
                 .status(r.status)
-                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+                )
                 .body(Full::new(Bytes::from(r.body)))
                 .expect("response build"));
         }
         if sub == "series" {
-            let match_list: Vec<String> = params
-                .get("match[]")
-                .cloned()
-                .unwrap_or_default();
+            let match_list: Vec<String> = params.get("match[]").cloned().unwrap_or_default();
             let r = prometheus_api::handle_series(
                 &match_list,
                 first_param(&params, "start").as_deref(),
@@ -563,7 +594,10 @@ async fn http_service(
             );
             return Ok(Response::builder()
                 .status(r.status)
-                .header(http::header::CONTENT_TYPE, prometheus_api::PROMETHEUS_API_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    prometheus_api::PROMETHEUS_API_CONTENT_TYPE,
+                )
                 .body(Full::new(Bytes::from(r.body)))
                 .expect("response build"));
         }
@@ -573,6 +607,21 @@ async fn http_service(
             "not_found",
             &format!("unknown API path: /api/v1/{}", sub),
         ));
+    }
+
+    // --- Root: home document (GET/HEAD /) ---
+    if path.is_empty() && (is_get || method == http::Method::HEAD) {
+        const HOME_HTML: &str = include_str!("../../static/index.html");
+        let body = if method == http::Method::HEAD {
+            Bytes::new()
+        } else {
+            Bytes::from(HOME_HTML.replace("{{VERSION}}", env!("CARGO_PKG_VERSION")))
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Full::new(body))
+            .expect("response build"));
     }
 
     // --- Ops endpoints (no auth – infrastructure probes for Kubernetes liveness/readiness) ---

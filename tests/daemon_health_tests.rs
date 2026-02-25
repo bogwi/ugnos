@@ -84,9 +84,7 @@ fn http_request(method: &str, host: &str, port: u16, path: &str) -> Option<(Stri
     let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream
-        .write_all(
-            format!("{} {} HTTP/1.0\r\nHost: {}\r\n\r\n", method, path, host).as_bytes(),
-        )
+        .write_all(format!("{} {} HTTP/1.0\r\nHost: {}\r\n\r\n", method, path, host).as_bytes())
         .ok()?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok()?;
@@ -304,12 +302,8 @@ fn prometheus_api_labels_returns_200_and_json() {
         &[("UGNOS__HTTP_READ_TOKEN", "test-read-token")],
     );
     thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
-    let result = http_get_full_body_with_auth(
-        "127.0.0.1",
-        port,
-        "/api/v1/labels",
-        Some("test-read-token"),
-    );
+    let result =
+        http_get_full_body_with_auth("127.0.0.1", port, "/api/v1/labels", Some("test-read-token"));
     let _ = child.kill();
     let _ = child.wait();
     assert!(result.is_some(), "GET /api/v1/labels must be reachable");
@@ -523,12 +517,8 @@ fn prom_read_api_wrong_token_returns_401() {
         http_get("127.0.0.1", port, "/healthz").is_some(),
         "daemon must be reachable"
     );
-    let result = http_get_full_body_with_auth(
-        "127.0.0.1",
-        port,
-        "/api/v1/labels",
-        Some("wrong-token"),
-    );
+    let result =
+        http_get_full_body_with_auth("127.0.0.1", port, "/api/v1/labels", Some("wrong-token"));
     let _ = child.kill();
     let _ = child.wait();
     assert!(result.is_some(), "GET /api/v1/labels must be reachable");
@@ -561,7 +551,10 @@ fn ops_endpoints_remain_unauthenticated() {
             "--http-bind",
             &bind,
         ],
-        &[("UGNOS__HTTP_READ_TOKEN", "secret"), ("UGNOS__HTTP_WRITE_TOKEN", "secret")],
+        &[
+            ("UGNOS__HTTP_READ_TOKEN", "secret"),
+            ("UGNOS__HTTP_WRITE_TOKEN", "secret"),
+        ],
     );
     thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
     let healthz = http_get("127.0.0.1", port, "/healthz");

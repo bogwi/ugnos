@@ -12,7 +12,6 @@ use crate::telemetry::db_metrics;
 use crate::telemetry::{DbEvent, DbEventListener, noop_event_listener};
 use crate::types::{DataPoint, Row, TagSet, Timestamp, Value};
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +68,12 @@ pub struct DbConfig {
     ///
     /// If the tag key is missing (or empty), the default scope is used.
     pub cardinality_scope_tag_key: Option<String>,
+    /// Maximum number of series to scan in parallel for multi-series queries (e.g. Prometheus API).
+    ///
+    /// When set to `Some(n)` with `n >= 1`, a dedicated thread pool of size `n` is used for
+    /// parallel series execution; query handlers will run at most `n` concurrent `query()` calls.
+    /// When `None`, the global Rayon pool is used with no explicit cap (default).
+    pub query_max_parallel_series: Option<usize>,
 }
 
 impl Default for DbConfig {
@@ -87,6 +92,7 @@ impl Default for DbConfig {
             event_listener: noop_event_listener(),
             max_series_cardinality: None,
             cardinality_scope_tag_key: None,
+            query_max_parallel_series: None,
         }
     }
 }
@@ -116,6 +122,8 @@ pub struct DbCore {
     cardinality_store: Option<Arc<CardinalityStore>>,
     /// Database configuration.
     config: DbConfig,
+    /// Optional dedicated thread pool for parallel series execution (when `query_max_parallel_series` is set).
+    query_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl DbCore {
@@ -405,10 +413,8 @@ impl DbCore {
                                 Err(_) => continue, // Skip if poisoned
                             };
 
-                            let data_to_flush = match buffer_guard.drain_all_buffers() {
-                                Ok(rows) => rows,
-                                Err(_) => HashMap::new(),
-                            };
+                            let data_to_flush =
+                                buffer_guard.drain_all_buffers().unwrap_or_default();
                             drop(buffer_guard);
 
                             let points_to_flush: u64 =
@@ -480,10 +486,8 @@ impl DbCore {
                             Ok(guard) => guard,
                             Err(_) => break, // Already poisoned, just exit
                         };
-                        let rows_to_flush = match buffer_guard.drain_all_buffers() {
-                            Ok(rows) => rows,
-                            Err(_) => HashMap::new(),
-                        };
+                        let rows_to_flush =
+                            buffer_guard.drain_all_buffers().unwrap_or_default();
                         drop(buffer_guard);
 
                         if !rows_to_flush.is_empty() {
@@ -541,6 +545,12 @@ impl DbCore {
             }
         });
 
+        let query_pool = config
+            .query_max_parallel_series
+            .filter(|&n| n >= 1)
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+            .map(Arc::new);
+
         Ok(DbCore {
             storage,
             write_buffer,
@@ -553,6 +563,7 @@ impl DbCore {
             cardinality,
             cardinality_store,
             config,
+            query_pool,
         })
     }
 
@@ -567,8 +578,10 @@ impl DbCore {
     /// # Panics
     /// Panics if the database cannot be initialized with the default configuration.
     pub fn new(flush_interval: Duration) -> Self {
-        let mut config = DbConfig::default();
-        config.flush_interval = flush_interval;
+        let config = DbConfig {
+            flush_interval,
+            ..Default::default()
+        };
         Self::with_config(config).expect("Failed to initialize DbCore with default configuration")
     }
 
@@ -610,7 +623,7 @@ impl DbCore {
                                 max_seq_seen = max_seq_seen.max(seq);
                                 rows_by_series
                                     .entry(series)
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .push(Row {
                                         seq,
                                         timestamp,
@@ -980,6 +993,15 @@ impl DbCore {
     /// * A reference to the `DbConfig` struct.
     pub fn get_config(&self) -> &DbConfig {
         &self.config
+    }
+
+    /// Returns the optional thread pool used for parallel series execution.
+    ///
+    /// When `query_max_parallel_series` is set in config, this pool limits concurrency
+    /// for multi-series queries (e.g. Prometheus API). Callers should run parallel
+    /// series iteration inside `pool.install(|| { ... })` when this is `Some`.
+    pub fn get_query_pool(&self) -> Option<&Arc<rayon::ThreadPool>> {
+        self.query_pool.as_ref()
     }
 }
 

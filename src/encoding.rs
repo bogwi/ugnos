@@ -10,6 +10,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
 
+/// Parsed v2 series block container: (row_count, float_codec, tag_codec, compression, compression_param, decompressed_payload).
+pub(crate) type SeriesBlockV2Decoded = (usize, u8, u8, u8, u32, Vec<u8>);
+
+/// Tag dictionary: (sorted dict strings, map (k,v) -> (key_id, value_id)).
+type TagDictResult = (Vec<String>, HashMap<(String, String), (u32, u32)>);
+
 // --- Public API ---
 
 /// Storage encoding configuration for series blocks within segment files.
@@ -169,7 +175,7 @@ pub(crate) fn encode_series_block(
 pub(crate) fn decode_series_block_v2_container(
     block: &[u8],
     path: &Path,
-) -> Result<(usize, u8, u8, u8, u32, Vec<u8>), DbError> {
+) -> Result<SeriesBlockV2Decoded, DbError> {
     let mut cur = std::io::Cursor::new(block);
     let mut magic = [0u8; 8];
     cur.read_exact(&mut magic)?;
@@ -225,7 +231,7 @@ pub(crate) fn decode_series_block_v2_container(
     }
 
     let hdr_len = cur.position() as usize;
-    if hdr_len.checked_add(stored_len).unwrap_or(usize::MAX) > block.len() {
+    if hdr_len.saturating_add(stored_len) > block.len() {
         return Err(DbError::Corruption {
             details: "Truncated series block payload".to_string(),
             series: None,
@@ -1171,7 +1177,7 @@ fn encode_tags_dictionary(rows: &[Row], out: &mut Vec<u8>) -> Result<(), DbError
 
 /// Builds the same dictionary as `encode_tags_dictionary` (sorted order) and returns
 /// (dict, map from (k,v) string pair to (key_id, value_id)) for (k,v) that appear in rows.
-fn build_tag_dict(rows: &[Row]) -> (Vec<String>, HashMap<(String, String), (u32, u32)>) {
+fn build_tag_dict(rows: &[Row]) -> TagDictResult {
     let mut uniq: BTreeSet<String> = BTreeSet::new();
     for r in rows {
         for (k, v) in &r.tags {
@@ -1258,7 +1264,7 @@ pub(crate) fn build_tag_block_index(rows: &[Row]) -> Result<Vec<u8>, DbError> {
         .try_into()
         .map_err(|_| DbError::Internal("Tag index payload too large".to_string()))?;
     let zstd =
-        zstd::stream::encode_all(std::io::Cursor::new(&raw), 3).map_err(|e| DbError::Io(e))?;
+        zstd::stream::encode_all(std::io::Cursor::new(&raw), 3).map_err(DbError::Io)?;
     let zstd_len: u32 = zstd
         .len()
         .try_into()
@@ -1331,7 +1337,7 @@ impl TagBlockIndex {
             TagBlockIndex::BitmapV1 {
                 row_count, bitmaps, ..
             } => {
-                let bytes = (*row_count + 7) / 8;
+                let bytes = (*row_count).div_ceil(8);
                 let mut result: Option<Vec<u8>> = None;
                 for (k, v) in filter {
                     let kid = *map.get(k.as_str())?;
@@ -1408,7 +1414,7 @@ impl TagBlockIndex {
         let bit_idx = i % 8;
         bitmap
             .get(byte_idx)
-            .map_or(false, |b| (b & (1 << bit_idx)) != 0)
+            .is_some_and(|b| (b & (1 << bit_idx)) != 0)
     }
 }
 
@@ -1605,7 +1611,7 @@ pub(crate) fn parse_tag_block_index(bytes: &[u8], path: &Path) -> Result<TagBloc
     })? as usize;
     if version == 1 {
         // Bitmap of row_count bits = ceil(row_count/8) bytes.
-        let bitmap_bytes = (row_count + 7) / 8;
+        let bitmap_bytes = row_count.div_ceil(8);
         let mut bitmaps = HashMap::new();
         for _ in 0..num_entries {
             let kid = read_var_u32(&mut cur).map_err(|d| DbError::Corruption {
@@ -1769,8 +1775,8 @@ mod encoding_compression_acceptance_tests {
         let q = decode_series_block_v1_for_query(&bytes, path).expect("v1 decode for query");
         let mut filter = TagSet::new();
         filter.insert("host".to_string(), "a".to_string());
-        for i in 0..rows.len() {
-            let expected = check_tags(&rows[i].tags, &filter);
+        for (i, row) in rows.iter().enumerate() {
+            let expected = check_tags(&row.tags, &filter);
             let got = q.row_matches_filter_v1(i, &filter).expect("tag match");
             assert_eq!(got, expected, "row_matches_filter_v1 mismatch at i={}", i);
         }

@@ -26,12 +26,14 @@ const SEG_FOOTER_MAGIC: &[u8; 8] = b"UGNSEGF1";
 const FOOTER_LEN: usize = 8 + 8 + 8 + 4; // magic + index_off + index_len + crc32
 
 fn make_cfg(dir: &Path, encoding: SegmentEncodingConfig) -> DbConfig {
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(3600); // reduce background noise
+    let mut cfg = DbConfig {
+        data_dir: dir.to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(3600), // reduce background noise
+        ..Default::default()
+    };
     cfg.segment_store.encoding = encoding;
     cfg
 }
@@ -107,10 +109,7 @@ fn parse_segment_index(seg_bytes: &[u8]) -> BTreeMap<String, SeriesIndexEntry> {
     let index_offset_usz: usize = index_offset.try_into().expect("index_offset usize");
     let index_len_usz: usize = index_len.try_into().expect("index_len usize");
     assert!(
-        index_offset_usz
-            .checked_add(index_len_usz)
-            .unwrap_or(usize::MAX)
-            <= seg_bytes.len(),
+        index_offset_usz.saturating_add(index_len_usz) <= seg_bytes.len(),
         "index range out of bounds"
     );
     let index_bytes = &seg_bytes[index_offset_usz..index_offset_usz + index_len_usz];
@@ -554,7 +553,7 @@ fn test_breakit_corrupt_any_byte_in_block_yields_corruption_error() {
     let off: usize = ent.offset.try_into().unwrap();
     let len: usize = ent.len.try_into().unwrap();
     assert!(
-        len >= SERIES_BLOCK_V2_HEADER_LEN + 1,
+        len > SERIES_BLOCK_V2_HEADER_LEN,
         "block has payload to corrupt"
     );
     let corrupt_at = off + SERIES_BLOCK_V2_HEADER_LEN;

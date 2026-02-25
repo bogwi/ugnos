@@ -64,14 +64,16 @@ fn emits_ingest_flush_wal_snapshot_metrics() {
         parse_sample(&before, "ugnos_snapshot_duration_seconds_count").unwrap_or(0.0);
 
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = false;
-    cfg.enable_wal = true;
-    cfg.wal_buffer_size = 1; // force WAL flush+fsync per insert
-    cfg.enable_snapshots = true;
-    cfg.snapshot_interval = Duration::from_secs(60 * 60);
-    cfg.flush_interval = Duration::from_secs(60 * 60);
+    let cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: false,
+        enable_wal: true,
+        wal_buffer_size: 1, // force WAL flush+fsync per insert
+        enable_snapshots: true,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    };
 
     let db = DbCore::with_config(cfg).expect("db init");
 

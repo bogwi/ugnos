@@ -350,7 +350,7 @@ impl SegmentStore {
     ) -> Result<(), DbError> {
         // Sort each series (timestamp, seq) for deterministic layout & query binary search.
         for rows in rows_by_series.values_mut() {
-            rows.sort_unstable_by(|a, b| (a.timestamp, a.seq).cmp(&(b.timestamp, b.seq)));
+            rows.sort_unstable_by_key(|a| (a.timestamp, a.seq));
         }
 
         let created_at = now_ns();
@@ -386,13 +386,15 @@ impl SegmentStore {
         let rec = write_segment_file(
             &tmp_path,
             &final_path,
-            id,
-            0,
-            created_at,
-            delete_before,
-            rows_by_series,
-            &self.encoding,
-            self.enable_tag_index,
+            WriteSegmentParams {
+                id,
+                level: 0,
+                created_at,
+                delete_before,
+                rows_by_series,
+                encoding: &self.encoding,
+                enable_tag_index: self.enable_tag_index,
+            },
         )?;
 
         // Install into manifest + active set atomically.
@@ -638,7 +640,7 @@ fn reclaim_retention(
             if rows.is_empty() {
                 continue;
             }
-            rows.sort_unstable_by(|a, b| (a.timestamp, a.seq).cmp(&(b.timestamp, b.seq)));
+            rows.sort_unstable_by_key(|a| (a.timestamp, a.seq));
             filtered.insert(series.clone(), rows);
         }
 
@@ -664,13 +666,15 @@ fn reclaim_retention(
         let new_rec = write_segment_file(
             &tmp_path,
             &final_path,
-            new_id,
-            level,
-            created_at,
-            Some(delete_before),
-            filtered,
-            &cfg.encoding,
-            cfg.enable_tag_index,
+            WriteSegmentParams {
+                id: new_id,
+                level,
+                created_at,
+                delete_before: Some(delete_before),
+                rows_by_series: filtered,
+                encoding: &cfg.encoding,
+                enable_tag_index: cfg.enable_tag_index,
+            },
         )?;
 
         // Atomically replace the segment in manifest + active set.
@@ -769,7 +773,7 @@ fn compact_l0_once(
 
         for (series, meta) in &seg.rec.series {
             let rows = read_series_all_rows(&seg.path, meta)?;
-            let entry = merged.entry(series.clone()).or_insert_with(Vec::new);
+            let entry = merged.entry(series.clone()).or_default();
             entry.extend(rows);
         }
     }
@@ -778,7 +782,7 @@ fn compact_l0_once(
     let delete_before = delete_before.unwrap_or(0);
     for rows in merged.values_mut() {
         rows.retain(|r| r.timestamp >= delete_before);
-        rows.sort_unstable_by(|a, b| (a.timestamp, a.seq).cmp(&(b.timestamp, b.seq)));
+        rows.sort_unstable_by_key(|a| (a.timestamp, a.seq));
     }
     merged.retain(|_, rows| !rows.is_empty());
 
@@ -824,13 +828,15 @@ fn compact_l0_once(
     let new_rec = write_segment_file(
         &tmp_path,
         &final_path,
-        new_id,
-        1,
-        created_at,
-        Some(delete_before),
-        merged,
-        &cfg.encoding,
-        cfg.enable_tag_index,
+        WriteSegmentParams {
+            id: new_id,
+            level: 1,
+            created_at,
+            delete_before: Some(delete_before),
+            rows_by_series: merged,
+            encoding: &cfg.encoding,
+            enable_tag_index: cfg.enable_tag_index,
+        },
     )?;
 
     // Install: remove old L0 from active list, add new L1, persist manifest.
@@ -897,17 +903,31 @@ fn reap_obsolete(state: &Arc<RwLock<StoreState>>) -> Result<(), DbError> {
     Ok(())
 }
 
-fn write_segment_file(
-    tmp_path: &Path,
-    final_path: &Path,
+/// Parameters for writing a segment file (used to avoid too many function arguments).
+struct WriteSegmentParams<'a> {
     id: u64,
     level: u8,
     created_at: Timestamp,
     delete_before: Option<Timestamp>,
     rows_by_series: HashMap<String, Vec<Row>>,
-    encoding: &SegmentEncodingConfig,
+    encoding: &'a SegmentEncodingConfig,
     enable_tag_index: bool,
+}
+
+fn write_segment_file(
+    tmp_path: &Path,
+    final_path: &Path,
+    params: WriteSegmentParams<'_>,
 ) -> Result<SegmentRecord, DbError> {
+    let WriteSegmentParams {
+        id,
+        level,
+        created_at,
+        delete_before,
+        rows_by_series,
+        encoding,
+        enable_tag_index,
+    } = params;
     // Build series blocks in a deterministic order.
     let mut series_names: Vec<String> = rows_by_series.keys().cloned().collect();
     series_names.sort();

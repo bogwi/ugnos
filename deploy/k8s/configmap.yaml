@@ -12,5 +12,7 @@ data:
     enable_snapshots = true
     enable_segments = true
     http_bind = "0.0.0.0:8080"
+    # http_write_token = "secret"
+    # http_read_token = "secret"
     [segment_store]
     compaction_check_interval_secs = 1
