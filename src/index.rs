@@ -29,6 +29,17 @@ impl SeriesKey {
             tags_sorted,
         }
     }
+
+    /// Returns the series (metric) name.
+    #[inline]
+    pub fn series_name(&self) -> &str {
+        &self.series
+    }
+
+    /// Returns the tag set as a `TagSet` (for Prometheus API and listing).
+    pub fn to_tag_set(&self) -> TagSet {
+        self.tags_sorted.iter().cloned().collect()
+    }
 }
 
 /// Tracks distinct series keys per scope and enforces a configurable hard limit.
@@ -121,6 +132,15 @@ impl CardinalityTracker {
         for k in keys {
             set.insert(k);
         }
+    }
+
+    /// Returns all series keys in the given scope (for Prometheus API metadata endpoints).
+    pub fn list_series_keys(&self, scope: &str) -> Vec<SeriesKey> {
+        let guard = self.by_scope.read().expect("cardinality tracker lock");
+        guard
+            .get(scope)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 

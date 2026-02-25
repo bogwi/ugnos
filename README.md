@@ -1,22 +1,23 @@
 # ugnos: Concurrent Time-Series Database Core in Rust
 
-`ugnos` is a concurrent, embeddable **time-series storage + query engine** designed for durability and high-throughput ingest in Rust services.
+`ugnos` is a concurrent, embeddable **time-series storage + query engine** designed for durability and high-throughput ingest in Rust services. The **ugnosd** daemon exposes Prometheus-compatible HTTP APIs (query, Remote Write) and optional gRPC with auth.
 
-For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md).
+For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md). Current release focus: **Milestone 2** — query engine + APIs (see [CHANGELOG](CHANGELOG.md) for 0.4.x and 0.5.0).
 
-For latest changelog, see the [CHANGELOG](CHANGELOG.md). README may lag behind.
+For latest changelog and version history, see the [CHANGELOG](CHANGELOG.md).
 
 ## What this is / what this is not (yet)
 
-This crate is a **library-grade database core** intended to be embedded into a Rust process (service/agent/daemon).
+This crate is a **library-grade database core** intended to be embedded into a Rust process (service/agent/daemon). The **ugnosd** daemon exposes it as a networked server (HTTP + gRPC) with auth and Prometheus-compatible APIs.
 
 - **This is**:
   - An embeddable time-series ingest + query core with WAL/snapshots/segments (SST-like) and a structured event hook.
-  - Suitable for single-process usage where you own deployment, IO, and operational integration.
+  - A production daemon (`ugnosd`) with HTTP ops (liveness/readiness), Prometheus Remote Write, Prometheus HTTP API (instant/range query, labels, series), optional gRPC, and deny-by-default AuthN/AuthZ.
+  - A **PromQL-like** query surface (vector/range selectors, label matchers, window functions, aggregations) with vectorized execution and Grafana-compatible Prometheus datasource.
+  - Suitable for single-process or single-node deployment where you own deployment, IO, and operational integration.
 - **This is not (yet)**:
-  - A networked database server (no HTTP/gRPC API, authn/authz, multi-tenant isolation).
   - A distributed system (no replication, consensus, sharding across nodes).
-  - A full query language / SQL layer (queries are programmatic APIs).
+  - A full SQL layer (queries are PromQL-like and programmatic APIs).
   - A turnkey operational product (no built-in backup orchestration, migrations tooling, or admin UI).
 
 ## Features (today)
@@ -37,6 +38,12 @@ This crate is a **library-grade database core** intended to be embedded into a R
 - **Retention/TTL**:
   - Immediate logical deletion via tombstone watermark.
   - Physical removal via compaction guarantees.
+- **Query & APIs** (daemon / library):
+  - **PromQL-like** query surface: vector/range selectors, label matchers (`=`, `!=`, `=~`, `!~`), window functions (`rate`, `increase`, `avg_over_time`, …), aggregations with grouping (`sum by`, `avg without`, …); IEEE 754 semantics (NaN propagation, min/max special case).
+  - Query planner with `explain()`; vectorized execution with optional parallelism cap (`query_max_parallel_series`).
+  - **Prometheus HTTP API v1**: `GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, `GET /api/v1/label/<name>/values`, `GET /api/v1/series` (Grafana Prometheus datasource compatible).
+  - **Prometheus Remote Write**: `POST /api/v1/write` (Snappy-compressed protobuf); backpressure/cardinality limit → 429 and metrics.
+  - **gRPC** (Tonic) for ingest/query/admin; **AuthN/AuthZ** deny-by-default for HTTP and gRPC (e.g. `http_write_token`, gRPC auth).
 - **Observability hooks**:
   - No stdout logging in core hot paths.
   - Structured `DbEvent` stream via `DbConfig.event_listener`.
@@ -197,15 +204,17 @@ The `ugnosd` binary runs UGNOS as a production daemon. Configuration is layered 
 
 1. **Defaults** — built-in `DbConfig` defaults  
 2. **Config file** — TOML at `--config <path>` or, if omitted, `ugnosd.toml` in the current directory (if present)  
-3. **Environment** — `UGNOS_*` variables (e.g. `UGNOS_DATA_DIR`, `UGNOS_HTTP_BIND`, `UGNOS_SEGMENT_STORE__COMPACTION_CHECK_INTERVAL_SECS`; use `__` for nested keys)  
+3. **Environment** — `UGNOS__*` variables (e.g. `UGNOS__DATA_DIR`, `UGNOS__HTTP_BIND`, `UGNOS__HTTP_WRITE_TOKEN`, `UGNOS__HTTP_READ_TOKEN`, `UGNOS__SEGMENT_STORE__COMPACTION_CHECK_INTERVAL_SECS`; use `__` for nested keys)  
 4. **CLI** — `--config`, `--data-dir`, `--http-bind`, `--no-config`, `--validate-config`
+
+**HTTP auth (deny-by-default):** When `http_write_token` or `http_read_token` is unset, the corresponding endpoints return 401. To enable auth: set `http_write_token` and/or `http_read_token` in TOML, or set `UGNOS__HTTP_WRITE_TOKEN` and/or `UGNOS__HTTP_READ_TOKEN` in the environment. Clients must send `Authorization: Bearer <token>`. `http_write_token` protects POST `/api/v1/write` (Remote Write); `http_read_token` protects the Prometheus read API (query, query_range, labels, series).
 
 **Safe startup:** Before opening the database, the daemon checks that `data_dir` exists (creates it if missing) and is writable. If config is invalid, the data directory is unusable, or recovery fails, the process exits with a non-zero status and an error message.
 
-**Health endpoints (HTTP):** The daemon serves ops endpoints on the address given by `http_bind` (default `127.0.0.1:8080`; use `0.0.0.0:8080` for Docker/Kubernetes):
+**HTTP endpoints:** The daemon serves on the address given by `http_bind` (default `127.0.0.1:8080`; use `0.0.0.0:8080` for Docker/Kubernetes):
 
-- **`GET /healthz`** — liveness: returns 200 when the process is alive and responding.
-- **`GET /readyz`** — readiness: returns 200 after the database has been opened and recovery has completed; returns 503 otherwise.
+- **Ops:** **`GET /healthz`** (liveness), **`GET /readyz`** (readiness). Readiness is 200 after DB open and recovery; 503 otherwise.
+- **Prometheus:** **`POST /api/v1/write`** (Remote Write), **`GET /api/v1/query`**, **`GET /api/v1/query_range`**, **`GET /api/v1/labels`**, **`GET /api/v1/label/<name>/values`**, **`GET /api/v1/series`**. Auth is deny-by-default when `http_write_token` (or gRPC auth) is configured.
 
 **Graceful shutdown:** On SIGINT (Ctrl+C) or SIGTERM, the daemon stops accepting new HTTP connections, waits for in-flight requests to finish (up to 30s), flushes the database buffer, then sends shutdown to the background flush thread (which performs a final flush and closes the WAL). The segment store’s compaction loop is stopped when the process exits. This guarantees WAL flush and a clean compaction stop as per the acceptance criteria.
 
@@ -269,7 +278,9 @@ With a config file (mount TOML and optional env overrides):
 docker run -d --name ugnosd -p 8080:8080 \
   -v ugnos_data:/var/lib/ugnos \
   -v /path/to/ugnosd.toml:/etc/ugnosd.toml:ro \
-  -e UGNOS_HTTP_BIND=0.0.0.0:8080 \
+  -e UGNOS__HTTP_BIND=0.0.0.0:8080 \
+  -e UGNOS__HTTP_WRITE_TOKEN=secret \
+  -e UGNOS__HTTP_READ_TOKEN=secret \
   ugnosd:latest --config /etc/ugnosd.toml
 ```
 
@@ -298,15 +309,13 @@ Tag and push to your registry (e.g. GitHub Container Registry or Docker Hub):
 
 ```bash
 # Example: GHCR
-docker tag ugnosd:latest ghcr.io/YOUR_ORG/ugnosd:0.4.1
-docker push ghcr.io/YOUR_ORG/ugnosd:0.4.1
+docker tag ugnosd:latest ghcr.io/YOUR_ORG/ugnosd:0.5.0
+docker push ghcr.io/YOUR_ORG/ugnosd:0.5.0
 
 # Example: Docker Hub
-docker tag ugnosd:latest YOUR_USER/ugnosd:0.4.1
-docker push YOUR_USER/ugnosd:0.4.1
+docker tag ugnosd:latest YOUR_USER/ugnosd:0.5.0
+docker push YOUR_USER/ugnosd:0.5.0
 ```
-
-Use a versioned tag (e.g. `0.4.1`) for production; avoid relying on `latest` for deployments.
 
 ### Verification (adversarial)
 
@@ -327,6 +336,30 @@ From the **ugnos** project root:
 ```bash
 cargo build --release
 cargo test
+```
+
+## Examples
+
+The [`examples/`](examples/) folder contains runnable demos:
+
+| Example | What it demonstrates |
+|---------|----------------------|
+| `persistence_demo` | DbConfig, insert, flush, snapshot, query, recover; restart flow |
+| `encoding_compression_demo` | Segment encoding (GorillaXor, Zstd), TagSet, insert/query |
+| `event_listener_demo` | DbEventListener, event stream; asserts on flush/snapshot events |
+| `cardinality_demo` | max_series_cardinality, cardinality_scope_tag_key; limit exceeded error |
+| `retention_demo` | retention_ttl; TTL expiry and compaction |
+| `query_tag_filter_demo` | db.query with tag filter; multiple series, filtered counts |
+| `gen_minimal_write_request` | Emits Snappy WriteRequest to stdout; pipe to curl for Remote Write |
+| `prometheus_api_client_demo` | GET query/query_range/labels/series against ugnosd; Grafana datasource reference |
+
+**Library examples** (persistence, encoding, event_listener, cardinality, retention, query_tag_filter) run standalone: `cargo run --example <name>`.
+
+**Server examples** require a running ugnosd with data. Use the scripts:
+
+```bash
+./scripts/run-prometheus-api-client-demo.sh   # Prometheus read API demo
+./scripts/verify-remote-write-query.sh         # Write → query assertion
 ```
 
 ## Benchmarks

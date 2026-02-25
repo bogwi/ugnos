@@ -3,20 +3,19 @@
 use crate::buffer::WriteBuffer;
 use crate::cardinality_store::CardinalityStore;
 use crate::error::DbError;
-use crate::index::{CardinalityTracker, SeriesKey, DEFAULT_CARDINALITY_SCOPE};
+use crate::index::{CardinalityTracker, DEFAULT_CARDINALITY_SCOPE, SeriesKey};
 use crate::persistence::{Snapshotter, WriteAheadLog};
 use crate::query::execute_query;
 use crate::segments::{SegmentStore, SegmentStoreConfig};
 use crate::storage::InMemoryStorage;
 use crate::telemetry::db_metrics;
-use crate::telemetry::{noop_event_listener, DbEvent, DbEventListener};
+use crate::telemetry::{DbEvent, DbEventListener, noop_event_listener};
 use crate::types::{DataPoint, Row, TagSet, Timestamp, Value};
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +68,12 @@ pub struct DbConfig {
     ///
     /// If the tag key is missing (or empty), the default scope is used.
     pub cardinality_scope_tag_key: Option<String>,
+    /// Maximum number of series to scan in parallel for multi-series queries (e.g. Prometheus API).
+    ///
+    /// When set to `Some(n)` with `n >= 1`, a dedicated thread pool of size `n` is used for
+    /// parallel series execution; query handlers will run at most `n` concurrent `query()` calls.
+    /// When `None`, the global Rayon pool is used with no explicit cap (default).
+    pub query_max_parallel_series: Option<usize>,
 }
 
 impl Default for DbConfig {
@@ -87,6 +92,7 @@ impl Default for DbConfig {
             event_listener: noop_event_listener(),
             max_series_cardinality: None,
             cardinality_scope_tag_key: None,
+            query_max_parallel_series: None,
         }
     }
 }
@@ -116,6 +122,8 @@ pub struct DbCore {
     cardinality_store: Option<Arc<CardinalityStore>>,
     /// Database configuration.
     config: DbConfig,
+    /// Optional dedicated thread pool for parallel series execution (when `query_max_parallel_series` is set).
+    query_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl DbCore {
@@ -405,10 +413,8 @@ impl DbCore {
                                 Err(_) => continue, // Skip if poisoned
                             };
 
-                            let data_to_flush = match buffer_guard.drain_all_buffers() {
-                                Ok(rows) => rows,
-                                Err(_) => HashMap::new(),
-                            };
+                            let data_to_flush =
+                                buffer_guard.drain_all_buffers().unwrap_or_default();
                             drop(buffer_guard);
 
                             let points_to_flush: u64 =
@@ -480,10 +486,8 @@ impl DbCore {
                             Ok(guard) => guard,
                             Err(_) => break, // Already poisoned, just exit
                         };
-                        let rows_to_flush = match buffer_guard.drain_all_buffers() {
-                            Ok(rows) => rows,
-                            Err(_) => HashMap::new(),
-                        };
+                        let rows_to_flush =
+                            buffer_guard.drain_all_buffers().unwrap_or_default();
                         drop(buffer_guard);
 
                         if !rows_to_flush.is_empty() {
@@ -541,6 +545,12 @@ impl DbCore {
             }
         });
 
+        let query_pool = config
+            .query_max_parallel_series
+            .filter(|&n| n >= 1)
+            .and_then(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().ok())
+            .map(Arc::new);
+
         Ok(DbCore {
             storage,
             write_buffer,
@@ -553,6 +563,7 @@ impl DbCore {
             cardinality,
             cardinality_store,
             config,
+            query_pool,
         })
     }
 
@@ -567,8 +578,10 @@ impl DbCore {
     /// # Panics
     /// Panics if the database cannot be initialized with the default configuration.
     pub fn new(flush_interval: Duration) -> Self {
-        let mut config = DbConfig::default();
-        config.flush_interval = flush_interval;
+        let config = DbConfig {
+            flush_interval,
+            ..Default::default()
+        };
         Self::with_config(config).expect("Failed to initialize DbCore with default configuration")
     }
 
@@ -610,7 +623,7 @@ impl DbCore {
                                 max_seq_seen = max_seq_seen.max(seq);
                                 rows_by_series
                                     .entry(series)
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .push(Row {
                                         seq,
                                         timestamp,
@@ -803,7 +816,7 @@ impl DbCore {
 
         // Acquire lock on the write buffer
         let mut buffer_guard = self.write_buffer.lock()?; // Propagate PoisonError
-                                                          // Stage the data point
+        // Stage the data point
         let res = buffer_guard.stage(series, row);
         if res.is_ok() {
             db_metrics::record_ingest_points(1);
@@ -938,6 +951,40 @@ impl DbCore {
         Ok(())
     }
 
+    /// Returns all known series keys `(series_name, tag_set)` in the default scope.
+    ///
+    /// Used by Prometheus API metadata endpoints. When segment store is used without
+    /// cardinality limits, the set is populated only by inserts in this process.
+    pub fn list_series_keys(&self) -> Vec<(String, TagSet)> {
+        let scope = self
+            .config
+            .cardinality_scope_tag_key
+            .as_deref()
+            .unwrap_or(DEFAULT_CARDINALITY_SCOPE);
+        self.cardinality
+            .list_series_keys(scope)
+            .into_iter()
+            .map(|k| (k.series_name().to_string(), k.to_tag_set()))
+            .collect()
+    }
+
+    /// Returns all series names present in the store (for Prometheus `__name__` label values).
+    ///
+    /// When segment store is enabled, names are collected from segment manifests; otherwise
+    /// from in-memory storage.
+    pub fn list_series_names(&self) -> Vec<String> {
+        if let Some(store) = &self.segment_store {
+            return store.list_series_names();
+        }
+        let guard = match self.storage.read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut names: Vec<String> = guard.get_all_series().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Returns a reference to the current database configuration.
     ///
     /// This allows inspection of the configuration used to initialize the database.
@@ -946,6 +993,15 @@ impl DbCore {
     /// * A reference to the `DbConfig` struct.
     pub fn get_config(&self) -> &DbConfig {
         &self.config
+    }
+
+    /// Returns the optional thread pool used for parallel series execution.
+    ///
+    /// When `query_max_parallel_series` is set in config, this pool limits concurrency
+    /// for multi-series queries (e.g. Prometheus API). Callers should run parallel
+    /// series iteration inside `pool.install(|| { ... })` when this is `Some`.
+    pub fn get_query_pool(&self) -> Option<&Arc<rayon::ThreadPool>> {
+        self.query_pool.as_ref()
     }
 }
 

@@ -639,7 +639,7 @@ impl Snapshotter {
     /// Loads the latest snapshot
     pub fn load_latest_snapshot(&self) -> Result<Option<HashMap<String, Vec<DataPoint>>>, DbError> {
         let mut snaps = list_snapshots(&self.snapshot_dir)?;
-        snaps.sort_by(|a, b| b.0.cmp(&a.0));
+        snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         let Some((_, latest_path)) = snaps.first() else {
             return Ok(None);
@@ -780,7 +780,7 @@ impl Snapshotter {
     /// Finds the latest snapshot timestamp
     pub fn get_latest_snapshot_timestamp(&self) -> Result<Option<Timestamp>, DbError> {
         let mut snaps = list_snapshots(&self.snapshot_dir)?;
-        snaps.sort_by(|a, b| b.0.cmp(&a.0));
+        snaps.sort_by_key(|b| std::cmp::Reverse(b.0));
         Ok(snaps.first().map(|(ts, _)| *ts))
     }
 }

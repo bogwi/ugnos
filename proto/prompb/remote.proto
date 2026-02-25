@@ -1,0 +1,11 @@
+// Minimal Prometheus prompb remote write (wire-format compatible).
+// Source: https://github.com/prometheus/prometheus/blob/main/prompb/remote.proto
+syntax = "proto3";
+
+package prometheus;
+
+import "prompb/types.proto";
+
+message WriteRequest {
+  repeated TimeSeries timeseries = 1;
+}

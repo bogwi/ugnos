@@ -152,12 +152,14 @@ fn segment_path(data_dir: &Path, file_name: &str) -> PathBuf {
 #[test]
 fn breakit_corrupt_tag_index_is_detected_and_query_errors() {
     let dir = TempDir::new().unwrap();
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
+    let mut cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    };
     cfg.segment_store.enable_tag_index = true;
 
     let db = DbCore::with_config(cfg).unwrap();

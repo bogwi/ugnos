@@ -19,7 +19,7 @@ fn tags_from(pairs: &[(&str, &str)]) -> TagSet {
 }
 
 // Helper function to sort query results for comparison
-fn sort_results(results: &mut Vec<(Timestamp, Value)>) {
+fn sort_results(results: &mut [(Timestamp, Value)]) {
     results.sort_by_key(|&(ts, _)| ts);
 }
 
@@ -245,6 +245,8 @@ fn test_invalid_time_range() {
     db.insert("test", 100, 1.0, TagSet::new()).unwrap();
     db.flush().unwrap();
 
+    // Intentionally use an invalid range (start > end) to assert API returns InvalidTimeRange.
+    #[allow(clippy::reversed_empty_ranges)]
     let result = db.query("test", 100..50, None);
     match result {
         Err(DbError::InvalidTimeRange { start, end }) => {

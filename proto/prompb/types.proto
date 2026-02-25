@@ -1,0 +1,22 @@
+// Minimal Prometheus prompb types for Remote Write ingest (wire-format compatible).
+// Source: https://github.com/prometheus/prometheus/blob/main/prompb/types.proto
+// Only Label, Sample, and TimeSeries (labels + samples) are used; exemplars/histograms omitted for ingest.
+syntax = "proto3";
+
+package prometheus;
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+message Sample {
+  double value = 1;
+  // Timestamp in milliseconds since Unix epoch (Prometheus remote_write convention).
+  int64 timestamp = 2;
+}
+
+message TimeSeries {
+  repeated Label labels = 1;
+  repeated Sample samples = 2;
+}

@@ -1,5 +1,5 @@
 # Example config for ugnosd. Copy to ugnosd.toml or pass via --config.
-# Environment variables UGNOS_* override (e.g. UGNOS_DATA_DIR, UGNOS_HTTP_BIND).
+# Environment variables UGNOS__* override (e.g. UGNOS__DATA_DIR, UGNOS__HTTP_BIND).
 # CLI flags override env and file.
 
 # HTTP listen address for /healthz and /readyz (liveness/readiness).
@@ -18,6 +18,14 @@ enable_segments = true
 retention_check_interval_secs = 1
 # max_series_cardinality = 100000
 # cardinality_scope_tag_key = "tenant"
+
+# Bearer token for POST /api/v1/write (Remote Write). If unset, write returns 401.
+# http_write_token = "your-secret"
+# Env override: UGNOS__HTTP_WRITE_TOKEN
+
+# Bearer token for GET/POST /api/v1/* (Prometheus read API). If unset, read returns 401.
+# http_read_token = "your-secret"
+# Env override: UGNOS__HTTP_READ_TOKEN
 
 [segment_store]
 compaction_check_interval_secs = 1

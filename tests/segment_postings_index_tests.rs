@@ -56,12 +56,14 @@ fn segment_postings_index_skips_non_matching_segments() {
     let before_skips = parse_counter(&before, "ugnos_tag_postings_segment_skips");
 
     let dir = TempDir::new().unwrap();
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(3600);
+    let mut cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(3600),
+        ..Default::default()
+    };
     cfg.segment_store.enable_tag_index = true;
 
     let db = DbCore::with_config(cfg).unwrap();

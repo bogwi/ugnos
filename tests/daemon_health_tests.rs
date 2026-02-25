@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HEALTH_PORT: u16 = 19499;
 const STARTUP_WAIT_MS: u64 = 800;
@@ -38,10 +38,53 @@ fn start_ugnosd_background(args: &[&str], env_extra: &[(&str, &str)]) -> Child {
 
 /// GET /path on host:port, return (status_line, body_prefix).
 fn http_get(host: &str, port: u16, path: &str) -> Option<(String, String)> {
+    http_request("GET", host, port, path)
+}
+
+/// GET /path on host:port, return (status_line, full_body).
+fn http_get_full_body(host: &str, port: u16, path: &str) -> Option<(String, String)> {
+    http_get_full_body_with_auth(host, port, path, None)
+}
+
+/// GET /path with optional Authorization: Bearer <token>, return (status_line, full_body).
+fn http_get_full_body_with_auth(
+    host: &str,
+    port: u16,
+    path: &str,
+    bearer_token: Option<&str>,
+) -> Option<(String, String)> {
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let auth_header = bearer_token
+        .map(|t| format!("Authorization: Bearer {}\r\n", t))
+        .unwrap_or_default();
+    stream
+        .write_all(
+            format!(
+                "GET {} HTTP/1.0\r\nHost: {}\r\n{}\r\n",
+                path, host, auth_header
+            )
+            .as_bytes(),
+        )
+        .ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    let mut lines = s.lines();
+    let status = lines.next()?.to_string();
+    let body = lines
+        .skip_while(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((status, body))
+}
+
+/// Send request with given method; return (status_line, body_prefix).
+fn http_request(method: &str, host: &str, port: u16, path: &str) -> Option<(String, String)> {
     let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream
-        .write_all(format!("GET {} HTTP/1.0\r\nHost: {}\r\n\r\n", path, host).as_bytes())
+        .write_all(format!("{} {} HTTP/1.0\r\nHost: {}\r\n\r\n", method, path, host).as_bytes())
         .ok()?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok()?;
@@ -56,6 +99,57 @@ fn http_get(host: &str, port: u16, path: &str) -> Option<(String, String)> {
         body[..20].to_string()
     } else {
         body
+    };
+    Some((status, body_prefix))
+}
+
+/// Poll /readyz until it responds or timeout. Robust for slow CI (recovery, disk I/O).
+fn wait_for_readyz(host: &str, port: u16, timeout_ms: u64) -> Option<(String, String)> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some(r) = http_get(host, port, "/readyz") {
+            return Some(r);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+/// POST with body and optional Authorization: Bearer <token>. Returns (status_line, body_prefix).
+fn http_post_with_body(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &[u8],
+    bearer_token: Option<&str>,
+) -> Option<(String, String)> {
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let auth_header = bearer_token
+        .map(|t| format!("Authorization: Bearer {}\r\n", t))
+        .unwrap_or_default();
+    let request = format!(
+        "POST {} HTTP/1.0\r\nHost: {}\r\nContent-Length: {}\r\n{}\r\n",
+        path,
+        host,
+        body.len(),
+        auth_header
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(body).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    let mut lines = s.lines();
+    let status = lines.next()?.to_string();
+    let response_body = lines
+        .skip_while(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_prefix = if response_body.len() > 60 {
+        response_body[..60].to_string()
+    } else {
+        response_body
     };
     Some((status, body_prefix))
 }
@@ -197,6 +291,300 @@ fn unknown_path_returns_404() {
     assert!(
         status.contains("404"),
         "expected 404 for unknown path, got: {}",
+        status
+    );
+}
+
+/// Prometheus read API (GET /api/v1/labels) with valid auth returns success JSON envelope.
+#[test]
+fn prometheus_api_labels_returns_200_and_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 5;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[("UGNOS__HTTP_READ_TOKEN", "test-read-token")],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    let result =
+        http_get_full_body_with_auth("127.0.0.1", port, "/api/v1/labels", Some("test-read-token"));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "GET /api/v1/labels must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("200"),
+        "expected 200 OK for /api/v1/labels, got: {}",
+        status
+    );
+    assert!(
+        body.contains("\"status\":\"success\""),
+        "Prometheus API envelope should have status success: {}",
+        &body[..body.len().min(200)]
+    );
+    assert!(
+        body.contains("__name__"),
+        "labels response should include __name__: {}",
+        &body[..body.len().min(200)]
+    );
+}
+
+#[test]
+fn post_healthz_returns_405() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let bind = format!("127.0.0.1:{}", HEALTH_PORT + 4);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    let result = http_request("POST", "127.0.0.1", HEALTH_PORT + 4, "/healthz");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "POST /healthz must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("405"),
+        "expected 405 Method Not Allowed for POST /healthz, got: {}",
+        status
+    );
+    assert!(
+        body.contains("Method Not Allowed") || body.contains("Not Allowed"),
+        "body should indicate method not allowed, got: {}",
+        body
+    );
+}
+
+// ---------- Prometheus Remote Write (POST /api/v1/write) ----------
+
+/// Deny-by-default: without http_write_token configured, POST /api/v1/write returns 401.
+#[test]
+fn post_api_v1_write_without_auth_returns_401() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 10;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    // Ensure daemon is up
+    let host = "127.0.0.1";
+    assert!(
+        http_get(host, port, "/healthz").is_some(),
+        "daemon must be reachable on port {}",
+        port
+    );
+    let result = http_post_with_body(host, port, "/api/v1/write", b"x", None);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "POST /api/v1/write must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("401"),
+        "expected 401 without auth, got: {}",
+        status
+    );
+    assert!(
+        body.contains("auth required") || body.contains("unauthorized"),
+        "body should indicate auth required: {}",
+        body
+    );
+}
+
+/// With http_write_token set, invalid payload returns 400.
+#[test]
+fn post_api_v1_write_invalid_payload_returns_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 11;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[("UGNOS__HTTP_WRITE_TOKEN", "test-token")],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    let host = "127.0.0.1";
+    assert!(
+        http_get(host, port, "/healthz").is_some(),
+        "daemon must be reachable on port {}",
+        port
+    );
+    let result = http_post_with_body(
+        host,
+        port,
+        "/api/v1/write",
+        b"not snappy",
+        Some("test-token"),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "POST /api/v1/write must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("400"),
+        "expected 400 for invalid payload, got: {}",
+        status
+    );
+    assert!(
+        body.contains("invalid") || body.contains("snappy") || body.contains("payload"),
+        "body should indicate invalid payload: {}",
+        body
+    );
+}
+
+// ---------- Prometheus read API auth (deny-by-default) ----------
+
+/// Deny-by-default: without http_read_token configured, GET /api/v1/labels returns 401.
+#[test]
+fn prom_read_api_no_token_configured_returns_401() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 20;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    assert!(
+        http_get("127.0.0.1", port, "/healthz").is_some(),
+        "daemon must be reachable"
+    );
+    let result = http_get_full_body("127.0.0.1", port, "/api/v1/labels");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "GET /api/v1/labels must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("401"),
+        "expected 401 Unauthorized (deny-by-default), got: {}",
+        status
+    );
+    assert!(
+        body.contains("auth") || body.contains("unauthorized"),
+        "body should indicate auth required: {}",
+        &body[..body.len().min(200)]
+    );
+}
+
+/// With http_read_token set, wrong bearer token returns 401.
+#[test]
+fn prom_read_api_wrong_token_returns_401() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 21;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[("UGNOS__HTTP_READ_TOKEN", "correct-token")],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    assert!(
+        http_get("127.0.0.1", port, "/healthz").is_some(),
+        "daemon must be reachable"
+    );
+    let result =
+        http_get_full_body_with_auth("127.0.0.1", port, "/api/v1/labels", Some("wrong-token"));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(result.is_some(), "GET /api/v1/labels must be reachable");
+    let (status, body) = result.unwrap();
+    assert!(
+        status.contains("401"),
+        "expected 401 for wrong token, got: {}",
+        status
+    );
+    assert!(
+        body.contains("unauthorized"),
+        "body should indicate unauthorized: {}",
+        &body[..body.len().min(200)]
+    );
+}
+
+/// Auth on read API does not affect ops endpoints: healthz remains unauthenticated.
+#[test]
+fn ops_endpoints_remain_unauthenticated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data_dir");
+    let port = HEALTH_PORT + 22;
+    let bind = format!("127.0.0.1:{}", port);
+    let mut child = start_ugnosd_background(
+        &[
+            "--no-config",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--http-bind",
+            &bind,
+        ],
+        &[
+            ("UGNOS__HTTP_READ_TOKEN", "secret"),
+            ("UGNOS__HTTP_WRITE_TOKEN", "secret"),
+        ],
+    );
+    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
+    let healthz = http_get("127.0.0.1", port, "/healthz");
+    let readyz = http_get("127.0.0.1", port, "/readyz");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(healthz.is_some());
+    let (status, _) = healthz.unwrap();
+    assert!(
+        status.contains("200"),
+        "healthz must remain 200 without auth: {}",
+        status
+    );
+    assert!(readyz.is_some());
+    let (status, _) = readyz.unwrap();
+    assert!(
+        status.contains("200"),
+        "readyz must remain 200 without auth: {}",
         status
     );
 }
@@ -367,8 +755,7 @@ compaction_check_interval_secs = 2
         ],
         &[],
     );
-    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
-    let second_readyz = http_get("127.0.0.1", HEALTH_PORT + 11, "/readyz");
+    let second_readyz = wait_for_readyz("127.0.0.1", HEALTH_PORT + 11, 5_000);
     let _ = child2.kill();
     let _ = child2.wait();
     assert!(

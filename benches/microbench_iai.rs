@@ -1,4 +1,4 @@
-use iai_callgrind::{library_benchmark, library_benchmark_group, main, LibraryBenchmarkConfig};
+use iai_callgrind::{LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -57,14 +57,16 @@ fn gen_ops(points: usize, series_count: usize, tag_pairs: usize) -> Vec<InsertOp
 
 fn setup_fixture(points: usize, enable_wal: bool, enable_snapshots: bool) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = dir.path().to_path_buf();
-    cfg.enable_segments = false;
-    cfg.enable_wal = enable_wal;
-    cfg.wal_buffer_size = 1024;
-    cfg.enable_snapshots = enable_snapshots;
-    cfg.snapshot_interval = Duration::from_secs(60 * 60);
-    cfg.flush_interval = Duration::from_secs(60 * 60);
+    let cfg = DbConfig {
+        data_dir: dir.path().to_path_buf(),
+        enable_segments: false,
+        enable_wal,
+        wal_buffer_size: 1024,
+        enable_snapshots,
+        snapshot_interval: Duration::from_secs(60 * 60),
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    };
 
     let db = DbCore::with_config(cfg).expect("db init");
     let ops = gen_ops(points, 64, 4);

@@ -1,32 +1,38 @@
 mod datasets;
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 use ugnos::encoding::{BlockCompression, FloatEncoding, SegmentEncodingConfig, TagEncoding};
+use ugnos::segments::SegmentStoreConfig;
 use ugnos::{DbConfig, DbCore, TagSet};
 
 use std::time::Duration;
 
 fn make_config(data_dir: &std::path::Path, enable_wal: bool) -> DbConfig {
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = data_dir.to_path_buf();
-    cfg.enable_segments = false; // microbench suite focuses on in-memory path determinism
-    cfg.enable_wal = enable_wal;
-    cfg.wal_buffer_size = 1024;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
-    cfg
+    DbConfig {
+        data_dir: data_dir.to_path_buf(),
+        enable_segments: false, // microbench suite focuses on in-memory path determinism
+        enable_wal,
+        wal_buffer_size: 1024,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        ..Default::default()
+    }
 }
 
 fn make_segments_config(data_dir: &std::path::Path, encoding: SegmentEncodingConfig) -> DbConfig {
-    let mut cfg = DbConfig::default();
-    cfg.data_dir = data_dir.to_path_buf();
-    cfg.enable_segments = true;
-    cfg.enable_wal = false;
-    cfg.enable_snapshots = false;
-    cfg.flush_interval = Duration::from_secs(60 * 60);
-    cfg.segment_store.encoding = encoding;
-    cfg
+    DbConfig {
+        data_dir: data_dir.to_path_buf(),
+        enable_segments: true,
+        enable_wal: false,
+        enable_snapshots: false,
+        flush_interval: Duration::from_secs(60 * 60),
+        segment_store: SegmentStoreConfig {
+            encoding,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn bench_ingest_fixed_dataset(c: &mut Criterion) {

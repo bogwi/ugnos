@@ -1,0 +1,90 @@
+// UGNOS gRPC API v1: ingest, query, and administration.
+// Package aligns with time-series semantics: series name, tags, timestamp (ns), value (f64).
+syntax = "proto3";
+
+package ugnos.v1;
+
+option java_multiple_files = true;
+option java_package = "io.ugnos.v1";
+option java_outer_classname = "UgnosProto";
+
+// ---------- Ingest ----------
+
+// A single data point: timestamp in nanoseconds since Unix epoch, value (f64), and tags.
+message DataPoint {
+  uint64 timestamp_ns = 1;
+  double value = 2;
+  map<string, string> tags = 3;
+}
+
+// One series: name + list of points. Multiple series can be sent in WriteRequest.
+message SeriesWrite {
+  string series = 1;
+  repeated DataPoint points = 2;
+}
+
+message WriteRequest {
+  repeated SeriesWrite series_writes = 1;
+}
+
+message WriteResponse {
+  // Total number of points accepted and staged.
+  uint64 points_written = 1;
+  // If non-empty, the first error message (e.g. cardinality limit, invalid range).
+  // Client may treat partial success when points_written < requested and message is set.
+  string first_error = 2;
+}
+
+// ---------- Query ----------
+
+message QueryRequest {
+  string series = 1;
+  // Time range: [start_ns, end_ns); end_ns exclusive.
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  // Optional tag filter: only points matching all key-value pairs are returned.
+  map<string, string> tag_filter = 4;
+  // Optional limit on number of points returned (server may enforce a max).
+  uint32 limit = 5;
+}
+
+message DataPointResult {
+  uint64 timestamp_ns = 1;
+  double value = 2;
+}
+
+message QueryResponse {
+  repeated DataPointResult points = 1;
+}
+
+// ---------- Administration ----------
+
+message FlushRequest {}
+
+message FlushResponse {}
+
+message CompactRequest {}
+
+message CompactResponse {}
+
+// Status: read-only view of server state for ops/debugging.
+message StatusRequest {}
+
+message StatusResponse {
+  string data_dir = 1;
+  bool segments_enabled = 2;
+  bool wal_enabled = 3;
+  bool snapshots_enabled = 4;
+  // Optional: current segment count (when segments enabled).
+  uint32 segment_count = 5;
+}
+
+// ---------- Service ----------
+
+service UgnosService {
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}

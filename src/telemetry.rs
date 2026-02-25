@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -56,7 +56,7 @@ pub fn noop_event_listener() -> Arc<dyn DbEventListener> {
 pub mod db_metrics {
     use super::*;
 
-    use ::metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    use ::metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 
     #[cfg(feature = "prometheus")]
     use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
@@ -84,6 +84,14 @@ pub mod db_metrics {
     pub const SERIES_CARDINALITY: &str = "ugnos_series_cardinality";
     /// Segment-level postings skips (query avoided reading a series block due to postings index).
     pub const TAG_POSTINGS_SEGMENT_SKIPS: &str = "ugnos_tag_postings_segment_skips";
+
+    /// gRPC request counter (labels: method, grpc_code). Captures all RPCs processed by the service impl.
+    pub const GRPC_REQUESTS: &str = "ugnos_grpc_requests";
+    /// gRPC request processing duration histogram (labels: method).
+    pub const GRPC_REQUEST_DURATION_SECONDS: &str = "ugnos_grpc_request_duration_seconds";
+
+    /// Remote write rejections (labels: reason). Emitted when POST /api/v1/write returns 429 or 400.
+    pub const REMOTE_WRITE_REJECTIONS: &str = "ugnos_remote_write_rejections";
 
     /// Handle to the in-process Prometheus recorder/scrape renderer.
     ///
@@ -227,6 +235,28 @@ pub mod db_metrics {
         ::metrics::counter!(TAG_POSTINGS_SEGMENT_SKIPS).increment(1);
     }
 
+    /// Records a remote write request rejection (400 invalid payload, 429 cardinality/backpressure).
+    #[inline]
+    pub fn record_remote_write_rejected(reason: &str) {
+        ::metrics::counter!(REMOTE_WRITE_REJECTIONS, "reason" => reason.to_string()).increment(1);
+    }
+
+    /// Records a gRPC request completion with method name, elapsed duration, and gRPC status code.
+    #[inline]
+    pub fn record_grpc_request(method: &str, duration: Duration, grpc_code: &str) {
+        ::metrics::counter!(
+            GRPC_REQUESTS,
+            "method" => method.to_string(),
+            "grpc_code" => grpc_code.to_string()
+        )
+        .increment(1);
+        ::metrics::histogram!(
+            GRPC_REQUEST_DURATION_SECONDS,
+            "method" => method.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
     fn describe_all() {
         // Counters
         describe_counter!(
@@ -287,6 +317,21 @@ pub mod db_metrics {
             SERIES_CARDINALITY,
             Unit::Count,
             "Current number of distinct series (series key = series name + tag set) per scope."
+        );
+        describe_counter!(
+            GRPC_REQUESTS,
+            Unit::Count,
+            "Total gRPC requests processed by the service, labelled by method and grpc_code."
+        );
+        describe_histogram!(
+            GRPC_REQUEST_DURATION_SECONDS,
+            Unit::Seconds,
+            "gRPC request processing duration by method."
+        );
+        describe_counter!(
+            REMOTE_WRITE_REJECTIONS,
+            Unit::Count,
+            "Remote write (POST /api/v1/write) requests rejected, labelled by reason (invalid_payload, cardinality_limit)."
         );
     }
 }

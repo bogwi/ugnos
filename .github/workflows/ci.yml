@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc (build.rs requires it for gRPC and remote-write protos)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: Unit + integration tests
         run: cargo test
 
@@ -37,7 +39,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc (build.rs requires it for gRPC and remote-write protos)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # On main we only save (no restore), so we never save the same key we restored.
+      # On branches/PRs we restore to compare against baseline.
       - name: Restore iai-callgrind baseline (for comparison / N/A avoidance)
+        if: github.ref != 'refs/heads/main'
         id: restore-iai
         uses: actions/cache/restore@v4
         with:
@@ -62,7 +69,6 @@ jobs:
             echo "::warning::No cached baseline (new repo or cache evicted); running with --save-baseline (no comparison). Push to main to establish baseline."
             cargo bench --bench microbench_iai -- --save-baseline=default
           fi
-      # Can fail with "another job may be creating this cache" if multiple main runs race; see dev/MICROBENCH_IAI_CI.md.
       - name: Save iai-callgrind baseline (main only, on success)
         if: success() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4

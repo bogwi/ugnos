@@ -2,10 +2,13 @@
 # Runtime verification: deploy ugnosd to a Kubernetes cluster, wait for Ready, assert /healthz and /readyz.
 # Exit 0 only when the workload actually runs and probes succeed.
 #
-# Prerequisites:
-#   - kubectl, reachable cluster, curl
-#   - Image ugnosd:latest available to the cluster (e.g. docker build -t ugnosd:latest .
-#     then kind load docker-image ugnosd:latest, or minikube image load ugnosd:latest)
+# Prerequisites (all must be true at the time you run this script):
+#   - kubectl and curl on PATH
+#   - A Kubernetes cluster running and reachable (kubectl config current-context points to it).
+#     If you have none, use verify-k8s-local.sh for a one-shot kind cluster, or start kind/minikube
+#     and leave it up before running this script.
+#   - Image ugnosd:latest available to that cluster (e.g. docker build -t ugnosd:latest .
+#     then kind load docker-image ugnosd:latest, or minikube image load ugnosd:latest).
 #
 # Run from ugnos project root: ./scripts/verify-k8s-deploy.sh
 

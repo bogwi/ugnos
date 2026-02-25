@@ -160,4 +160,36 @@ fn validate_config_prints_http_bind() {
         "validate-config should print http_bind: {}",
         stdout
     );
+    assert!(
+        stdout.contains("grpc_bind="),
+        "validate-config should print grpc_bind: {}",
+        stdout
+    );
+}
+
+#[test]
+fn valid_config_with_grpc_auth_loads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("ugnosd.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+data_dir = "/tmp/ugnos_grpc_auth_test"
+[grpc_auth]
+keys = [
+    { token = "ingest-token", permissions = ["ingest", "query"] },
+    { token = "admin-token", permissions = ["admin"] },
+]
+"#,
+    )
+    .expect("write config");
+    let (ok, _stdout, stderr) = run_ugnosd(
+        &[
+            "--validate-config",
+            "--config",
+            config_path.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(ok, "grpc_auth config should load: {}", stderr);
 }
