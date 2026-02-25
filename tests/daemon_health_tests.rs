@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HEALTH_PORT: u16 = 19499;
 const STARTUP_WAIT_MS: u64 = 800;
@@ -101,6 +101,18 @@ fn http_request(method: &str, host: &str, port: u16, path: &str) -> Option<(Stri
         body
     };
     Some((status, body_prefix))
+}
+
+/// Poll /readyz until it responds or timeout. Robust for slow CI (recovery, disk I/O).
+fn wait_for_readyz(host: &str, port: u16, timeout_ms: u64) -> Option<(String, String)> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some(r) = http_get(host, port, "/readyz") {
+            return Some(r);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    None
 }
 
 /// POST with body and optional Authorization: Bearer <token>. Returns (status_line, body_prefix).
@@ -743,8 +755,7 @@ compaction_check_interval_secs = 2
         ],
         &[],
     );
-    thread::sleep(Duration::from_millis(STARTUP_WAIT_MS));
-    let second_readyz = http_get("127.0.0.1", HEALTH_PORT + 11, "/readyz");
+    let second_readyz = wait_for_readyz("127.0.0.1", HEALTH_PORT + 11, 5_000);
     let _ = child2.kill();
     let _ = child2.wait();
     assert!(
