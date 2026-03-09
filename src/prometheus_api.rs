@@ -9,6 +9,7 @@
 //! with `by`/`without` grouping — sufficient for a representative Grafana
 //! dashboard subset.
 
+use crate::promql::{self, PromqlError};
 use crate::DbCore;
 use crate::error::DbError;
 use crate::query::{
@@ -16,7 +17,7 @@ use crate::query::{
     compute_rate, compute_sum_over_time,
 };
 use crate::query_surface::{
-    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, parse_eval_expr, parse_instant_selector,
+    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, parse_instant_selector,
     series_matches_selector,
 };
 use http::StatusCode;
@@ -239,9 +240,10 @@ pub(crate) struct EvalSample {
 }
 
 /// Per-series data for range (matrix) evaluation: step-aligned `(ts_ns, value)` pairs.
-struct EvalSeriesData {
-    metric: HashMap<String, String>,
-    steps: Vec<(u64, f64)>,
+/// Used by the public [`crate::promql::query_range`] API and by HTTP serialization.
+pub(crate) struct EvalSeriesData {
+    pub metric: HashMap<String, String>,
+    pub steps: Vec<(u64, f64)>,
 }
 
 // ---------- Instant query evaluation ----------
@@ -476,7 +478,8 @@ fn group_metric(metric: &HashMap<String, String>, grouping: &Grouping) -> HashMa
 // ---------- Range (matrix) query evaluation ----------
 
 /// Evaluate an expression over a time range, producing step-aligned matrix data.
-fn eval_matrix(
+/// Used by the public [`crate::promql::query_range`] API; HTTP handler delegates to that.
+pub(crate) fn eval_matrix(
     expr: &EvalExpr,
     start_ns: u64,
     end_ns: u64,
@@ -504,6 +507,14 @@ fn eval_matrix(
 }
 
 /// Evaluate an instant selector over a range: at each step, find the latest sample.
+///
+/// **Step semantics (proof that stored steps are a subset of the full grid):**
+/// The loop iterates over the full grid `t = start_ns, start_ns+step_ns, ... <= end_ns`.
+/// A step `(t, val)` is pushed only when there exists a point with `pt <= eval_ts` (see
+/// `if let Some(...)` below). If at a grid time there is no such point (e.g. first sample
+/// is after that time), that step is omitted. Hence the stored steps are exactly those
+/// grid times where the series has a defined value — a *subset* of the full grid, not
+/// necessarily the same count across series.
 fn eval_instant_matrix(
     selector: &InstantSelector,
     start_ns: u64,
@@ -563,6 +574,10 @@ fn eval_instant_matrix(
 
 /// Evaluate a range function over a time range: pre-fetch the full data window,
 /// then compute the function at each step.
+///
+/// **Step semantics:** Same as instant matrix: we iterate the full grid but push only
+/// when `apply_range_fn` returns `Ok(Some(val))`; otherwise that step is omitted.
+/// So stored steps are a subset of the full grid.
 fn eval_range_fn_matrix(
     func: RangeFn,
     selector: &InstantSelector,
@@ -733,6 +748,8 @@ pub fn handle_query(
 }
 
 /// GET /api/v1/query_range?query=...&start=...&end=...&step=...
+///
+/// Delegates to [`promql::query_range`]; no duplicated evaluation logic.
 pub fn handle_query_range(
     query_param: Option<&str>,
     start_param: Option<&str>,
@@ -780,13 +797,6 @@ pub fn handle_query_range(
             );
         }
     };
-    if start_ns >= end_ns {
-        return PrometheusApiResponse::err_json(
-            StatusCode::BAD_REQUEST,
-            "bad_data",
-            "start must be before end".to_string(),
-        );
-    }
     let step_secs = match parse_step_seconds(step_param) {
         Ok(s) => s,
         Err(e) => {
@@ -795,20 +805,19 @@ pub fn handle_query_range(
     };
     let step_ns = step_secs * 1_000_000_000;
 
-    let expr = match parse_eval_expr(query) {
-        Ok(e) => e,
-        Err(e) => {
+    let series = match promql::query_range(db, query, start_ns, end_ns, step_ns) {
+        Ok(s) => s,
+        Err(PromqlError::Parse(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "bad_data",
                 e,
             );
         }
-    };
-
-    let eval_data = match eval_matrix(&expr, start_ns, end_ns, step_ns, db) {
-        Ok(d) => d,
-        Err(e) => {
+        Err(PromqlError::BadParameter(e)) => {
+            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+        }
+        Err(PromqlError::Execution(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -817,11 +826,11 @@ pub fn handle_query_range(
         }
     };
 
-    let matrix: Vec<MatrixSeries> = eval_data
+    let matrix: Vec<MatrixSeries> = series
         .into_iter()
-        .map(|sd| MatrixSeries {
-            metric: sd.metric,
-            values: sd
+        .map(|rs| MatrixSeries {
+            metric: rs.metric,
+            values: rs
                 .steps
                 .into_iter()
                 .map(|(ts, val)| json_sample_pair(ts, val))
