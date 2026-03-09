@@ -228,13 +228,14 @@ impl PrometheusApiResponse {
     }
 }
 
-// ---------- Internal evaluation types ----------
+// ---------- Internal evaluation types (pub(crate) for promql module) ----------
 
 /// Intermediate per-series data during evaluation (before JSON formatting).
-struct EvalSample {
-    metric: HashMap<String, String>,
-    ts_ns: u64,
-    value: f64,
+#[allow(missing_docs)]
+pub(crate) struct EvalSample {
+    pub metric: HashMap<String, String>,
+    pub ts_ns: u64,
+    pub value: f64,
 }
 
 /// Per-series data for range (matrix) evaluation: step-aligned `(ts_ns, value)` pairs.
@@ -246,7 +247,8 @@ struct EvalSeriesData {
 // ---------- Instant query evaluation ----------
 
 /// Evaluate an expression at a single instant, returning a vector of samples.
-fn eval_vector(
+/// Used by the public [`crate::promql::query_instant`] API.
+pub(crate) fn eval_vector(
     expr: &EvalExpr,
     time_ns: u64,
     db: &Arc<DbCore>,
@@ -671,6 +673,8 @@ fn aggregate_matrix(
 // ---------- Public API handlers ----------
 
 /// GET /api/v1/query?query=...&time=...
+///
+/// Delegates to [`crate::promql::query_instant`]; parses time param then serializes the result.
 pub fn handle_query(
     query_param: Option<&str>,
     time_param: Option<&str>,
@@ -686,16 +690,6 @@ pub fn handle_query(
             );
         }
     };
-    let expr = match parse_eval_expr(query) {
-        Ok(e) => e,
-        Err(e) => {
-            return PrometheusApiResponse::err_json(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "bad_data",
-                e,
-            );
-        }
-    };
     let time_ns = match parse_time_param(time_param) {
         Ok(t) => t,
         Err(e) => {
@@ -703,9 +697,19 @@ pub fn handle_query(
         }
     };
 
-    let samples = match eval_vector(&expr, time_ns, db) {
+    let samples = match crate::promql::query_instant(db, query, time_ns) {
         Ok(s) => s,
-        Err(e) => {
+        Err(crate::promql::PromqlError::Parse(e)) => {
+            return PrometheusApiResponse::err_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bad_data",
+                e,
+            );
+        }
+        Err(crate::promql::PromqlError::BadParameter(e)) => {
+            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+        }
+        Err(crate::promql::PromqlError::Execution(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",

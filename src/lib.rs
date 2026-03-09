@@ -28,6 +28,9 @@ pub mod remote_write;
 /// Prometheus HTTP API v1 (query, query_range, labels, label values, series) for Grafana compatibility.
 pub mod prometheus_api;
 
+/// PromQL library API: run PromQL against a [`DbCore`] from library code (no HTTP).
+pub mod promql;
+
 /// Generated Prometheus prompb types (WriteRequest, TimeSeries, Sample, Label).
 pub mod prometheus {
     #![allow(clippy::all)]
