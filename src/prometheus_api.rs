@@ -844,18 +844,44 @@ pub fn handle_query_range(
     })
 }
 
-/// GET /api/v1/labels
-pub fn handle_labels(db: &Arc<DbCore>) -> PrometheusApiResponse {
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    names.insert("__name__".to_string());
-    for (_, tags) in db.list_series_keys() {
-        for k in tags.keys() {
-            names.insert(k.clone());
+/// GET /api/v1/labels?match[]=...&start=...&end=...
+///
+/// Delegates to [`promql::labels`]; no duplicated metadata logic.
+/// Optional `start`/`end` (Unix seconds or RFC3339): if both provided, restrict to that time range;
+/// if either missing, use 0 to now for backward compatibility.
+pub fn handle_labels(
+    match_params: &[String],
+    start_param: Option<&str>,
+    end_param: Option<&str>,
+    db: &Arc<DbCore>,
+) -> PrometheusApiResponse {
+    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => now_ns(),
+    };
+    let match_selectors: Option<&[String]> = if match_params.is_empty() {
+        None
+    } else {
+        Some(match_params)
+    };
+    match promql::labels(db, match_selectors, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
+        }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    let mut data: Vec<String> = names.into_iter().collect();
-    data.sort();
-    PrometheusApiResponse::ok_json(data)
 }
 
 /// GET /api/v1/label/<name>/values
@@ -1083,7 +1109,7 @@ mod tests {
     #[test]
     fn labels_returns_name_and_known_labels() {
         let (db, _guard) = make_db_with_series();
-        let r = handle_labels(&db);
+        let r = handle_labels(&[], None, None, &db);
         assert_eq!(r.status, StatusCode::OK);
         let s = String::from_utf8(r.body).unwrap();
         let body: ApiEnvelope<Vec<String>> = serde_json::from_str(&s).unwrap();

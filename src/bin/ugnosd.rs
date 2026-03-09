@@ -559,7 +559,13 @@ async fn http_service(
                 .expect("response build"));
         }
         if sub == "labels" {
-            let r = prometheus_api::handle_labels(&state.db);
+            let match_list: Vec<String> = params.get("match[]").cloned().unwrap_or_default();
+            let r = prometheus_api::handle_labels(
+                &match_list,
+                first_param(&params, "start").as_deref(),
+                first_param(&params, "end").as_deref(),
+                &state.db,
+            );
             return Ok(Response::builder()
                 .status(r.status)
                 .header(
