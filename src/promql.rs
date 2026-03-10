@@ -10,6 +10,7 @@ use crate::prometheus_api::{eval_matrix, eval_vector};
 use crate::query_surface::{parse_eval_expr, parse_instant_selector, series_matches_selector};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Unified error type for PromQL library operations.
 ///
@@ -224,6 +225,122 @@ pub fn query_range(
             steps: sd.steps,
         })
         .collect())
+}
+
+// ---------- Time and step parsing (single source of truth for HTTP and library) ----------
+
+/// Current time in nanoseconds since Unix epoch.
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Parses an optional evaluation time string into nanoseconds since Unix epoch.
+///
+/// Same behavior as the `time` query parameter of `GET /api/v1/query` and the
+/// `start`/`end` parameters of range and metadata endpoints. Use this so config/CLI
+/// string params produce identical values to the HTTP layer (behavioral parity).
+///
+/// # Arguments
+/// * `s` - `None` or empty/whitespace → "now" (current time in ns). Otherwise a string
+///   representing Unix time: integer or float seconds (e.g. `"123"`, `"123.5"`).
+///
+/// # Returns
+/// * `Ok(ns)` - Evaluation time in nanoseconds since Unix epoch.
+/// * `Err(msg)` - Invalid format (e.g. negative, non-numeric, or non-finite).
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::parse_eval_time;
+///
+/// // Omit or empty → "now"
+/// let now_ns = parse_eval_time(None).unwrap();
+/// let now_ns2 = parse_eval_time(Some("")).unwrap();
+/// assert_eq!(parse_eval_time(Some("1")).unwrap(), 1_000_000_000);
+/// assert_eq!(parse_eval_time(Some("2.5")).unwrap(), 2_500_000_000);
+/// ```
+pub fn parse_eval_time(s: Option<&str>) -> Result<u64, String> {
+    let s = match s {
+        Some(t) => t.trim(),
+        None => return Ok(now_ns()),
+    };
+    if s.is_empty() {
+        return Ok(now_ns());
+    }
+    if let Ok(secs) = s.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            return Ok((secs * 1e9) as u64);
+        }
+    }
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(secs * 1_000_000_000);
+    }
+    Err(format!(
+        "invalid time parameter (use Unix seconds): {:?}",
+        s
+    ))
+}
+
+/// Parses a step string into nanoseconds.
+///
+/// Same behavior as the `step` query parameter of `GET /api/v1/query_range`. Use this
+/// so config/CLI step params produce identical values to the HTTP layer (behavioral parity).
+/// Supports a bare number (seconds), or a number with suffix: `s`, `m`, `h`, `d` (case-insensitive).
+///
+/// # Arguments
+/// * `s` - Step string (e.g. `"15s"`, `"1m"`, `"1h"`, `"1d"`, or `"30"` for 30 seconds).
+///
+/// # Returns
+/// * `Ok(ns)` - Step in nanoseconds (aligns with `step_ns` in [`query_range`]).
+/// * `Err(msg)` - Empty string, missing, or invalid format (e.g. negative or unknown unit).
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::parse_step;
+///
+/// assert_eq!(parse_step("15s").unwrap(), 15_000_000_000);
+/// assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+/// assert_eq!(parse_step("1h").unwrap(), 3_600_000_000_000);
+/// assert_eq!(parse_step("1d").unwrap(), 86_400_000_000_000);
+/// assert_eq!(parse_step("30").unwrap(), 30_000_000_000);
+/// ```
+pub fn parse_step(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty step parameter".to_string());
+    }
+    let s = ascii_lower(s);
+    let (num_str, mult) = if s.ends_with('s') {
+        (&s[..s.len() - 1], 1u64)
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 60)
+    } else if s.ends_with('h') {
+        (&s[..s.len() - 1], 3600)
+    } else if s.ends_with('d') {
+        (&s[..s.len() - 1], 86400)
+    } else if let Ok(n) = s.parse::<f64>() {
+        if !n.is_finite() || n < 0.0 {
+            return Err("step must be non-negative".to_string());
+        }
+        return Ok((n as u64) * 1_000_000_000);
+    } else {
+        return Err(format!("invalid step: {:?}", s));
+    };
+    let n: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid step number: {:?}", num_str))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err("step must be non-negative".to_string());
+    }
+    Ok((n * mult as f64) as u64 * 1_000_000_000)
+}
+
+fn ascii_lower(s: &str) -> String {
+    s.chars().map(|c| c.to_ascii_lowercase()).collect()
 }
 
 /// Returns the set of label names present in series that match the optional selectors
@@ -637,6 +754,213 @@ mod tests {
 
     fn sort_samples(samples: &mut [InstantSample]) {
         samples.sort_by_key(|a| metric_sort_key(&a.metric));
+    }
+
+    // --- Time and step parsing: unit tests and HTTP parity ---
+
+    #[test]
+    fn parse_eval_time_none_or_empty_means_now() {
+        let t_none = parse_eval_time(None).unwrap();
+        let t_empty = parse_eval_time(Some("")).unwrap();
+        let t_whitespace = parse_eval_time(Some("  \t ")).unwrap();
+        assert!(t_none > 0, "now should be positive");
+        assert!(t_empty > 0);
+        assert!(t_whitespace > 0);
+        // All resolve to "now"; exact equality not required (evaluated at slightly different times).
+    }
+
+    #[test]
+    fn parse_eval_time_unix_seconds_integer() {
+        assert_eq!(parse_eval_time(Some("0")).unwrap(), 0);
+        assert_eq!(parse_eval_time(Some("1")).unwrap(), 1_000_000_000);
+        assert_eq!(parse_eval_time(Some("123")).unwrap(), 123_000_000_000);
+        assert_eq!(parse_eval_time(Some(" 2 ")).unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn parse_eval_time_unix_seconds_float() {
+        assert_eq!(parse_eval_time(Some("1.5")).unwrap(), 1_500_000_000);
+        assert_eq!(parse_eval_time(Some("2.5")).unwrap(), 2_500_000_000);
+        assert_eq!(parse_eval_time(Some("0.001")).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parse_eval_time_invalid_returns_error() {
+        let err = parse_eval_time(Some("-1")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("x")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("inf")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("nan")).unwrap_err();
+        assert!(err.contains("invalid time parameter"), "NaN must be rejected");
+    }
+
+    #[test]
+    fn parse_step_seconds_unit() {
+        assert_eq!(parse_step("15s").unwrap(), 15_000_000_000);
+        assert_eq!(parse_step("0s").unwrap(), 0);
+        assert_eq!(parse_step(" 30s ").unwrap(), 30_000_000_000);
+        assert_eq!(parse_step("15S").unwrap(), 15_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_minutes_hours_days() {
+        assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("2m").unwrap(), 120_000_000_000);
+        assert_eq!(parse_step("1h").unwrap(), 3_600_000_000_000);
+        assert_eq!(parse_step("1d").unwrap(), 86_400_000_000_000);
+        assert_eq!(parse_step("1M").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("1H").unwrap(), 3_600_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_bare_number_is_seconds() {
+        assert_eq!(parse_step("30").unwrap(), 30_000_000_000);
+        assert_eq!(parse_step("1").unwrap(), 1_000_000_000);
+        assert_eq!(parse_step("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_step_fractional_duration() {
+        assert_eq!(parse_step("1.5m").unwrap(), 90_000_000_000);
+        assert_eq!(parse_step("0.5h").unwrap(), 1_800_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_empty_or_invalid_returns_error() {
+        assert!(parse_step("").unwrap_err().contains("empty step"));
+        assert!(parse_step("  ").unwrap_err().contains("empty step"));
+        assert!(parse_step("x").unwrap_err().contains("invalid step"));
+        assert!(
+            parse_step("1x").unwrap_err().contains("invalid step"),
+            "unknown unit or invalid number"
+        );
+        assert!(parse_step("-1s").unwrap_err().contains("non-negative"));
+        assert!(
+            parse_step("-1").unwrap_err().contains("non-negative"),
+            "bare negative step must be rejected (parity with -1s)"
+        );
+    }
+
+    /// Equivalent duration representations yield the same step in ns (Prometheus-style step parsing).
+    /// Aligns with time-series DB practice: multiple string forms for the same duration must be equivalent.
+    #[test]
+    fn parse_step_equivalent_durations_same_ns() {
+        assert_eq!(
+            parse_step("60s").unwrap(),
+            parse_step("1m").unwrap(),
+            "60s and 1m must yield same step_ns"
+        );
+        assert_eq!(
+            parse_step("3600s").unwrap(),
+            parse_step("1h").unwrap(),
+            "3600s and 1h must yield same step_ns"
+        );
+        assert_eq!(
+            parse_step("86400s").unwrap(),
+            parse_step("1d").unwrap(),
+            "86400s and 1d must yield same step_ns"
+        );
+        assert_eq!(parse_step("60s").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+    }
+
+    /// Parser accepts step "0" (returns 0 ns); query_range rejects step_ns == 0 at use site (BadParameter).
+    /// Single source of truth: parser defines string→ns; business rule (positive step) enforced in query_range.
+    #[test]
+    fn parse_step_zero_accepted_parser_rejected_by_query_range() {
+        assert_eq!(parse_step("0").unwrap(), 0);
+        assert_eq!(parse_step("0s").unwrap(), 0);
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            parse_step("0").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PromqlError::BadParameter(m) if m.contains("step")),
+            "query_range must reject step_ns 0: {:?}",
+            err
+        );
+    }
+
+    /// Behavioral parity: parsed time/step values match what the HTTP layer uses (single source of truth).
+    /// Same string inputs produce the same u64 ns values; HTTP handlers call these same helpers.
+    #[test]
+    fn parse_eval_time_and_step_same_values_as_http_layer() {
+        assert_eq!(
+            parse_eval_time(Some("2")).unwrap(),
+            2_000_000_000,
+            "time param \"2\" must yield 2s in ns for HTTP and library"
+        );
+        assert_eq!(
+            parse_eval_time(Some("0")).unwrap(),
+            0,
+            "time param \"0\" must yield 0 ns"
+        );
+        assert_eq!(
+            parse_step("1").unwrap(),
+            1_000_000_000,
+            "step param \"1\" must yield 1s in ns for HTTP and library"
+        );
+        assert_eq!(
+            parse_step("15s").unwrap(),
+            15_000_000_000,
+            "step param \"15s\" must yield 15s in ns"
+        );
+    }
+
+    /// Parity: instant query using parse_eval_time produces same result as direct time_ns.
+    #[test]
+    fn parse_eval_time_used_in_query_instant_matches_direct_time_ns() {
+        let (db, _guard) = make_db_with_series();
+        let time_ns_from_parser = parse_eval_time(Some("2")).unwrap();
+        let from_parser = query_instant(&db, "http_requests_total", time_ns_from_parser).unwrap();
+        let direct = query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        assert_eq!(from_parser.len(), direct.len());
+        assert_eq!(from_parser.len(), 2, "expect two series at t=2");
+        let mut a = from_parser;
+        let mut b = direct;
+        sort_samples(&mut a);
+        sort_samples(&mut b);
+        assert_eq!(a[0].value, b[0].value);
+        assert_eq!(a[1].value, b[1].value);
+    }
+
+    /// Parity: range query using parse_step produces same step grid as direct step_ns.
+    #[test]
+    fn parse_step_used_in_query_range_matches_direct_step_ns() {
+        let (db, _guard) = make_db_with_series();
+        let step_ns_from_parser = parse_step("1").unwrap();
+        let from_parser = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            step_ns_from_parser,
+        )
+        .unwrap();
+        let direct = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(from_parser.len(), direct.len());
+        if let (Some(a), Some(b)) = (from_parser.first(), direct.first()) {
+            assert_eq!(a.steps.len(), b.steps.len(), "same step count");
+            assert_eq!(
+                a.steps.first().map(|(t, _)| *t),
+                b.steps.first().map(|(t, _)| *t),
+                "same first step time"
+            );
+        }
     }
 
     // --- Instant query: same semantics as GET /api/v1/query ---

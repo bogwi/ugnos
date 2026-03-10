@@ -24,7 +24,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Content-Type for Prometheus API JSON responses.
 pub const PROMETHEUS_API_CONTENT_TYPE: &str = "application/json";
@@ -110,77 +109,6 @@ fn format_sample_value(v: f64) -> String {
 
 fn ns_to_sec(ns: u64) -> f64 {
     (ns as f64) / 1e9
-}
-
-/// Current time in nanoseconds since epoch.
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-/// Parse optional `time` query param: Unix seconds (float or int) or RFC3339.
-fn parse_time_param(s: Option<&str>) -> Result<u64, String> {
-    let s = match s {
-        Some(t) => t.trim(),
-        None => return Ok(now_ns()),
-    };
-    if s.is_empty() {
-        return Ok(now_ns());
-    }
-    if let Ok(secs) = s.parse::<f64>() {
-        if secs.is_finite() && secs >= 0.0 {
-            return Ok((secs * 1e9) as u64);
-        }
-    }
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(secs * 1_000_000_000);
-    }
-    Err(format!(
-        "invalid time parameter (use Unix seconds): {:?}",
-        s
-    ))
-}
-
-/// Parse duration in seconds from step param (e.g. "15s" -> 15, "1m" -> 60).
-fn parse_step_seconds(s: Option<&str>) -> Result<u64, String> {
-    let s = match s {
-        Some(t) => t.trim(),
-        None => return Err("missing step parameter".to_string()),
-    };
-    if s.is_empty() {
-        return Err("empty step parameter".to_string());
-    }
-    let s = ascii_lower(s);
-    let (num_str, mult) = if s.ends_with("s") {
-        (&s[..s.len() - 1], 1u64)
-    } else if s.ends_with("m") {
-        (&s[..s.len() - 1], 60)
-    } else if s.ends_with("h") {
-        (&s[..s.len() - 1], 3600)
-    } else if s.ends_with("d") {
-        (&s[..s.len() - 1], 86400)
-    } else if let Ok(n) = s.parse::<f64>() {
-        return Ok(if n >= 0.0 && n.is_finite() {
-            n as u64
-        } else {
-            1
-        });
-    } else {
-        return Err(format!("invalid step: {:?}", s));
-    };
-    let n: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid step number: {:?}", num_str))?;
-    if !n.is_finite() || n < 0.0 {
-        return Err("step must be non-negative".to_string());
-    }
-    Ok((n * mult as f64) as u64)
-}
-
-fn ascii_lower(s: &str) -> String {
-    s.chars().map(|c| c.to_ascii_lowercase()).collect()
 }
 
 /// Build Prometheus metric map from series name and tag set (including __name__).
@@ -704,7 +632,7 @@ pub fn handle_query(
             );
         }
     };
-    let time_ns = match parse_time_param(time_param) {
+    let time_ns = match promql::parse_eval_time(time_param) {
         Ok(t) => t,
         Err(e) => {
             return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
@@ -767,7 +695,7 @@ pub fn handle_query_range(
         }
     };
     let start_ns = match start_param {
-        Some(s) => match parse_time_param(Some(s)) {
+        Some(s) => match promql::parse_eval_time(Some(s)) {
             Ok(t) => t,
             Err(e) => {
                 return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
@@ -782,7 +710,7 @@ pub fn handle_query_range(
         }
     };
     let end_ns = match end_param {
-        Some(s) => match parse_time_param(Some(s)) {
+        Some(s) => match promql::parse_eval_time(Some(s)) {
             Ok(t) => t,
             Err(e) => {
                 return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
@@ -796,13 +724,21 @@ pub fn handle_query_range(
             );
         }
     };
-    let step_secs = match parse_step_seconds(step_param) {
-        Ok(s) => s,
-        Err(e) => {
-            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+    let step_ns = match step_param {
+        Some(s) => match promql::parse_step(s) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+            }
+        },
+        None => {
+            return PrometheusApiResponse::err_json(
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                "missing step parameter".to_string(),
+            );
         }
     };
-    let step_ns = step_secs * 1_000_000_000;
 
     let series = match promql::query_range(db, query, start_ns, end_ns, step_ns) {
         Ok(s) => s,
@@ -854,13 +790,13 @@ pub fn handle_labels(
     end_param: Option<&str>,
     db: &Arc<DbCore>,
 ) -> PrometheusApiResponse {
-    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
         None => 0,
     };
-    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
-        None => now_ns(),
+        None => promql::parse_eval_time(None).unwrap(),
     };
     let match_selectors: Option<&[String]> = if match_params.is_empty() {
         None
@@ -894,13 +830,13 @@ pub fn handle_label_values(
     end_param: Option<&str>,
     db: &Arc<DbCore>,
 ) -> PrometheusApiResponse {
-    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
         None => 0,
     };
-    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
-        None => now_ns(),
+        None => promql::parse_eval_time(None).unwrap(),
     };
     let match_selectors: Option<&[String]> = if match_params.is_empty() {
         None
@@ -934,13 +870,13 @@ pub fn handle_series(
     end_param: Option<&str>,
     db: &Arc<DbCore>,
 ) -> PrometheusApiResponse {
-    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
         None => 0,
     };
-    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
         Some(t) => t,
-        None => now_ns(),
+        None => promql::parse_eval_time(None).unwrap(),
     };
     match promql::series(db, match_params, start_ns, end_ns) {
         Ok(data) => PrometheusApiResponse::ok_json(data),
