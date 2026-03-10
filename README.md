@@ -1,8 +1,34 @@
 # ugnos: Concurrent Time-Series Database Core in Rust
 
+## Ugnos has a healthy number of 100+ re-clones per 14 days after each feature release. **THANK YOU ALL FOR USING UGNOS!**
+
+## Description
+
 `ugnos` is a concurrent, embeddable **time-series storage + query engine** designed for durability and high-throughput ingest in Rust services. The **ugnosd** daemon exposes Prometheus-compatible HTTP APIs (query, Remote Write) and optional gRPC with auth.
 
-For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md). Current release focus: **Milestone 2** — query engine + APIs (see [CHANGELOG](CHANGELOG.md) for 0.4.x and 0.5.0).
+For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md).
+
+We plan to add client SDKs for multiple languages (Rust, Go, Python, TypeScript); the order and the structure is not yet fixed. We tend to monorepo, as shown below:
+```
+Organization: ugnos
+
+Single repo: ugnos/ugnos (or ugnos/monorepo)
+
+ugnos/
+├── core/                    # Daemon + library crate (current contents of ugnos repo)
+│   ├── src/
+│   ├── proto/               # ugnos + prompb
+│   ├── openapi.yaml         # (future)
+│   ├── Cargo.toml
+│   └── ...
+├── sdk/
+│   ├── rust/                 # Client crate (crates.io)
+│   ├── go/                   # Go module
+│   ├── python/               # PyPI package
+│   └── typescript/           # npm package
+├── .github/workflows/        # Path-filtered CI: core, sdk/rust, sdk/go, etc.
+└── README.md                 # Points to core/ and sdk/* subdirs
+```
 
 For latest changelog and version history, see the [CHANGELOG](CHANGELOG.md).
 
@@ -14,6 +40,7 @@ This crate is a **library-grade database core** intended to be embedded into a R
   - An embeddable time-series ingest + query core with WAL/snapshots/segments (SST-like) and a structured event hook.
   - A production daemon (`ugnosd`) with HTTP ops (liveness/readiness), Prometheus Remote Write, Prometheus HTTP API (instant/range query, labels, series), optional gRPC, and deny-by-default AuthN/AuthZ.
   - A **PromQL-like** query surface (vector/range selectors, label matchers, window functions, aggregations) with vectorized execution and Grafana-compatible Prometheus datasource.
+  - A **PromQL library API** (`ugnos::promql`): run instant query, range query, labels, label values, and series directly against a `DbCore` from Rust code — typed results (`InstantSample`, `RangeSeries`, `MetricLabels`), unified `PromqlError`, and optional time/step parsing; no HTTP required.
   - Suitable for single-process or single-node deployment where you own deployment, IO, and operational integration.
 - **This is not (yet)**:
   - A distributed system (no replication, consensus, sharding across nodes).
@@ -41,6 +68,7 @@ This crate is a **library-grade database core** intended to be embedded into a R
 - **Query & APIs** (daemon / library):
   - **PromQL-like** query surface: vector/range selectors, label matchers (`=`, `!=`, `=~`, `!~`), window functions (`rate`, `increase`, `avg_over_time`, …), aggregations with grouping (`sum by`, `avg without`, …); IEEE 754 semantics (NaN propagation, min/max special case).
   - Query planner with `explain()`; vectorized execution with optional parallelism cap (`query_max_parallel_series`).
+  - **PromQL library API** (`ugnos::promql`): `query_instant`, `query_range`, `labels`, `label_values`, `series` with typed results and `PromqlError`; optional `parse_eval_time` / `parse_step` for config/CLI parity with the HTTP API.
   - **Prometheus HTTP API v1**: `GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, `GET /api/v1/label/<name>/values`, `GET /api/v1/series` (Grafana Prometheus datasource compatible).
   - **Prometheus Remote Write**: `POST /api/v1/write` (Snappy-compressed protobuf); backpressure/cardinality limit → 429 and metrics.
   - **gRPC** (Tonic) for ingest/query/admin; **AuthN/AuthZ** deny-by-default for HTTP and gRPC (e.g. `http_write_token`, gRPC auth).
@@ -352,8 +380,9 @@ The [`examples/`](examples/) folder contains runnable demos:
 | `query_tag_filter_demo` | db.query with tag filter; multiple series, filtered counts |
 | `gen_minimal_write_request` | Emits Snappy WriteRequest to stdout; pipe to curl for Remote Write |
 | `prometheus_api_client_demo` | GET query/query_range/labels/series against ugnosd; Grafana datasource reference |
+| `promql_library_demo` | Run PromQL from Rust: instant/range query, labels, label_values, series; SLO-style request observability |
 
-**Library examples** (persistence, encoding, event_listener, cardinality, retention, query_tag_filter) run standalone: `cargo run --example <name>`.
+**Library examples** (persistence, encoding, event_listener, cardinality, retention, query_tag_filter, promql_library_demo) run standalone: `cargo run --example <name>`.
 
 **Server examples** require a running ugnosd with data. Use the scripts:
 
