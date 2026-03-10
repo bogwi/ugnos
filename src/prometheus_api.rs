@@ -1586,4 +1586,220 @@ mod tests {
         };
         assert!(samples.is_empty(), "sum of empty set should be empty");
     }
+
+    // ---------- HTTP handler delegation and PromqlError → status mapping (4.1 acceptance) ----------
+
+    /// Parse errors (invalid/unsupported PromQL) must map to 422 and envelope errorType "bad_data".
+    #[test]
+    fn handler_parse_error_maps_to_422() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("metric_a + metric_b"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "error");
+        assert_eq!(body.error_type.as_deref(), Some("bad_data"));
+        assert!(body.error.is_some());
+    }
+
+    /// Bad parameter (invalid time/step/range) must map to 400.
+    #[test]
+    fn handler_bad_parameter_maps_to_400() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("http_requests_total"), Some("not-a-number"), &db);
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let body: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "error");
+        assert_eq!(body.error_type.as_deref(), Some("bad_data"));
+    }
+
+    /// Range query: missing step → 400.
+    #[test]
+    fn handler_query_range_missing_step_returns_400() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            None,
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Success response contract: status "success", data present, resultType and result shape.
+    #[test]
+    fn handler_success_envelope_contract() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("http_requests_total"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let data = body.data.expect("success response must have data");
+        assert_eq!(data.result_type, "vector");
+        let QueryResult::Vector(samples) = data.result else {
+            panic!("expected vector")
+        };
+        for s in &samples {
+            assert_eq!(s.value.len(), 2, "vector sample must be [timestamp, value]");
+            assert!(s.value[0].is_number(), "timestamp must be number");
+            assert!(s.value[1].is_string(), "value must be string (Prometheus format)");
+        }
+    }
+
+    /// Matrix response contract: resultType "matrix", each series has values [[ts, "val"], ...].
+    #[test]
+    fn handler_matrix_envelope_contract() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            Some("1s"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let data = body.data.expect("success response must have data");
+        assert_eq!(data.result_type, "matrix");
+        let QueryResult::Matrix(series) = data.result else {
+            panic!("expected matrix")
+        };
+        for s in &series {
+            for pair in &s.values {
+                assert_eq!(pair.len(), 2);
+                assert!(pair[0].is_number());
+                assert!(pair[1].is_string());
+            }
+        }
+    }
+
+    /// Handler delegation: instant query HTTP response matches library `query_instant` result (same samples, same values).
+    #[test]
+    fn handler_instant_query_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let time_ns = 2_000_000_000;
+        let lib_result = crate::promql::query_instant(&db, "http_requests_total", time_ns).unwrap();
+        let r = handle_query(Some("http_requests_total"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        let QueryResult::Vector(mut samples) = body.data.unwrap().result else {
+            panic!("expected vector")
+        };
+        sort_vector_samples(&mut samples);
+        assert_eq!(
+            samples.len(),
+            lib_result.len(),
+            "handler must return same number of samples as library"
+        );
+        let mut lib_sorted: Vec<_> = lib_result.iter().collect();
+        lib_sorted.sort_by_key(|s| metric_sort_key(&s.metric));
+        for (http_s, lib_s) in samples.iter().zip(lib_sorted) {
+            assert_eq!(http_s.metric, lib_s.metric);
+            let http_val: f64 = http_s.value[1].as_str().unwrap().parse().unwrap();
+            assert!(
+                (http_val - lib_s.value).abs() < 1e-9,
+                "value mismatch: HTTP {} vs library {}",
+                http_val,
+                lib_s.value
+            );
+        }
+    }
+
+    /// Handler delegation: range query HTTP response matches library `query_range` result.
+    #[test]
+    fn handler_range_query_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+        let lib_result = crate::promql::query_range(
+            &db,
+            "http_requests_total",
+            start_ns,
+            end_ns,
+            step_ns,
+        )
+        .unwrap();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            Some("1s"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        let QueryResult::Matrix(mut series) = body.data.unwrap().result else {
+            panic!("expected matrix")
+        };
+        sort_matrix_series(&mut series);
+        assert_eq!(
+            series.len(),
+            lib_result.len(),
+            "handler must return same number of series as library"
+        );
+        let mut lib_sorted: Vec<_> = lib_result.iter().collect();
+        lib_sorted.sort_by_key(|s| metric_sort_key(&s.metric));
+        for (http_s, lib_s) in series.iter().zip(lib_sorted) {
+            assert_eq!(http_s.metric, lib_s.metric);
+            assert_eq!(http_s.values.len(), lib_s.steps.len());
+            for (hp, lp) in http_s.values.iter().zip(lib_s.steps.iter()) {
+                let ts_sec = hp[0].as_f64().unwrap();
+                assert!(
+                    (ts_sec * 1e9 - lp.0 as f64).abs() < 1.0,
+                    "timestamp mismatch"
+                );
+                let http_val: f64 = hp[1].as_str().unwrap().parse().unwrap();
+                assert!(
+                    (http_val - lp.1).abs() < 1e-9,
+                    "value mismatch at step"
+                );
+            }
+        }
+    }
+
+    /// Handler delegation: labels HTTP response matches library `labels` (same set of names).
+    #[test]
+    fn handler_labels_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result = crate::promql::labels(&db, None as Option<&[&str]>, start_ns, end_ns).unwrap();
+        let r = handle_labels(&[], None, None, &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler labels must match library");
+    }
+
+    /// Handler delegation: series HTTP response matches library `series` (same label sets).
+    #[test]
+    fn handler_series_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let match_selectors = ["http_requests_total"];
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result =
+            crate::promql::series(&db, &match_selectors, start_ns, end_ns).unwrap();
+        let r = handle_series(
+            &match_selectors.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
+            None,
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<HashMap<String, String>>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        assert_eq!(http_data.len(), lib_result.len());
+        let mut http_sorted: Vec<_> = http_data.iter().map(metric_sort_key).collect();
+        http_sorted.sort();
+        let mut lib_sorted: Vec<_> = lib_result.iter().map(metric_sort_key).collect();
+        lib_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler series must match library");
+    }
 }
