@@ -1,8 +1,8 @@
 //! PromQL library API: single entry point for running PromQL against a [`DbCore`].
 //!
-//! Exposes instant query, range query, and labels (with label values and series in follow-up work)
-//! with the same semantics as the Prometheus HTTP API (`GET /api/v1/query`, `GET /api/v1/query_range`,
-//! `GET /api/v1/labels`, etc.), using typed programmatic contracts and a unified error type.
+//! Exposes instant query, range query, labels, and label values with the same semantics as the
+//! Prometheus HTTP API (`GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`,
+//! `GET /api/v1/label/<name>/values`, etc.), using typed programmatic contracts and a unified error type.
 
 use crate::core::DbCore;
 use crate::error::DbError;
@@ -290,6 +290,98 @@ pub fn labels(
         }
     }
     let mut data: Vec<String> = names.into_iter().collect();
+    data.sort();
+    Ok(data)
+}
+
+/// Returns the set of values for a given label name from series that match the optional selectors
+/// and have at least one sample in the time range `[start_ns, end_ns]` (inclusive).
+///
+/// Same semantics as `GET /api/v1/label/<name>/values`: optional `match[]` restricts to series
+/// matching any of the given PromQL instant selectors; required `start`/`end` restrict to an
+/// approximate time range (only series with data in that range contribute their label values).
+/// For the special label `__name__`, returns metric names (series names) instead of a tag value.
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `label_name` - Label whose values to return (use `__name__` for metric names).
+/// * `match_selectors` - Optional list of PromQL instant selectors. If `None` or empty, all series
+///   in the store are considered (within the time range).
+/// * `start_ns` - Start of the time range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the time range (inclusive), nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - Sorted list of unique label values; may be empty if no series have the label or
+///   no series have data in range.
+/// * `Err(PromqlError::BadParameter(_))` - `start_ns >= end_ns`.
+/// * `Err(PromqlError::Parse(_))` - A selector in `match_selectors` is invalid PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error while checking series in range.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::label_values;
+/// use std::sync::Arc;
+///
+/// let db: Arc<DbCore> = /* ... */;
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// // All values for "job" in the time range
+/// let values = label_values(&db, "job", None::<&[String]>, start_ns, end_ns)?;
+/// // Only values from series matching the selector
+/// let values = label_values(&db, "job", Some(&["http_requests_total{instance=\"a\"}".into()]), start_ns, end_ns)?;
+/// // Metric names (same as values for __name__)
+/// let names = label_values(&db, "__name__", None::<&[String]>, start_ns, end_ns)?;
+/// ```
+pub fn label_values(
+    db: &Arc<DbCore>,
+    label_name: &str,
+    match_selectors: Option<&[impl AsRef<str>]>,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<String>, PromqlError> {
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    let query_end = end_ns.saturating_add(1);
+
+    let keys = db.list_series_keys();
+
+    let keys_to_consider: Vec<(String, HashMap<String, String>)> = match match_selectors {
+        None => keys.clone(),
+        Some(s) if s.is_empty() => keys.clone(),
+        Some(selectors) => {
+            let parsed: Vec<_> = selectors
+                .iter()
+                .map(|s| parse_instant_selector(s.as_ref().trim()).map_err(PromqlError::Parse))
+                .collect::<Result<Vec<_>, _>>()?;
+            keys.into_iter()
+                .filter(|(name, tags)| {
+                    parsed.iter().any(|inst| {
+                        series_matches_selector(name, tags, &inst.selector)
+                    })
+                })
+                .collect()
+        }
+    };
+
+    let mut values: HashSet<String> = HashSet::new();
+    for (series_name, tags) in keys_to_consider {
+        let range = start_ns..query_end;
+        match db.query(&series_name, range, Some(&tags)) {
+            Ok(points) if !points.is_empty() => {
+                if label_name == "__name__" {
+                    values.insert(series_name);
+                } else if let Some(v) = tags.get(label_name) {
+                    values.insert(v.clone());
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let mut data: Vec<String> = values.into_iter().collect();
     data.sort();
     Ok(data)
 }
@@ -716,6 +808,127 @@ mod tests {
         assert!(names.contains(&"__name__".to_string()));
         assert!(names.contains(&"job".to_string()));
         assert!(names.contains(&"instance".to_string()));
+    }
+
+    // --- Label values: same semantics as GET /api/v1/label/<name>/values (library-only, no HTTP) ---
+    // Tests follow Prometheus metadata API and time-series DB practices: time-range restriction
+    // so only series with data in [start_ns, end_ns] contribute; optional match[] filtering;
+    // __name__ returns metric names; unknown label returns empty (see Prometheus PR #7288, #8301).
+
+    #[test]
+    fn label_values_returns_sorted_unique_values_for_label() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(&db, "job", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert!(values.contains(&"api".to_string()));
+        assert!(values.contains(&"web".to_string()));
+        let mut sorted = values.clone();
+        sorted.sort();
+        assert_eq!(values, sorted, "label values must be returned sorted");
+    }
+
+    #[test]
+    fn label_values_for_name_returns_metric_names() {
+        let (db, _guard) = make_db_with_series();
+        let names = label_values(&db, "__name__", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert_eq!(names, ["http_requests_total"]);
+    }
+
+    #[test]
+    fn label_values_with_match_selector_restricts_to_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(
+            &db,
+            "job",
+            Some(&["http_requests_total{job=\"api\"}".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(values, ["api"]);
+    }
+
+    #[test]
+    fn label_values_time_range_excludes_series_with_no_data_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Data at 1s, 1.5s, 2s. Range [2.5s, 3s] contains no samples -> empty values for "job".
+        let values = label_values(&db, "job", None::<&[String]>, 2_500_000_000, 3_000_000_000).unwrap();
+        assert!(values.is_empty());
+        let names = label_values(&db, "__name__", None::<&[String]>, 2_500_000_000, 3_000_000_000).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn label_values_time_range_includes_only_series_with_points_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Range [1s, 1.2s]: only api series has a point at 1s; web has 1.5s. So only "api" for job.
+        let values = label_values(&db, "job", None::<&[String]>, 1_000_000_000, 1_200_000_000).unwrap();
+        assert_eq!(values, ["api"]);
+    }
+
+    #[test]
+    fn label_values_start_ge_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = label_values(&db, "job", None::<&[String]>, 2_000_000_000, 1_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn label_values_invalid_match_selector_returns_parse_error() {
+        let (db, _guard) = make_db_with_series();
+        let err = label_values(
+            &db,
+            "job",
+            Some(&["sum(rate(x[5m]))".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn label_values_unknown_label_returns_empty() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(&db, "nonexistent_label", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn label_values_library_parity_with_instant_and_labels() {
+        // Acceptance: caller can execute label values from library only; no duplicated metadata logic.
+        let (db, _guard) = make_db_for_aggregation();
+        let _samples = query_instant(&db, "http_requests_total", 3_000_000_000).unwrap();
+        let _names = labels(
+            &db,
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let job_values = label_values(
+            &db,
+            "job",
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(job_values.contains(&"api".to_string()));
+        assert!(job_values.contains(&"web".to_string()));
+        let instance_values = label_values(
+            &db,
+            "instance",
+            None::<&[String]>,
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(instance_values.contains(&"a".to_string()));
+        assert!(instance_values.contains(&"b".to_string()));
+        assert!(instance_values.contains(&"c".to_string()));
     }
 
     // --- Range query: same semantics as GET /api/v1/query_range (library-only, no HTTP) ---

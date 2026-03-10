@@ -580,7 +580,14 @@ async fn http_service(
                 .strip_prefix("label/")
                 .and_then(|s| s.strip_suffix("/values"))
                 .unwrap_or("");
-            let r = prometheus_api::handle_label_values(name, &state.db);
+            let match_list: Vec<String> = params.get("match[]").cloned().unwrap_or_default();
+            let r = prometheus_api::handle_label_values(
+                name,
+                &match_list,
+                first_param(&params, "start").as_deref(),
+                first_param(&params, "end").as_deref(),
+                &state.db,
+            );
             return Ok(Response::builder()
                 .status(r.status)
                 .header(

@@ -885,22 +885,43 @@ pub fn handle_labels(
 }
 
 /// GET /api/v1/label/<name>/values
-pub fn handle_label_values(label_name: &str, db: &Arc<DbCore>) -> PrometheusApiResponse {
-    let mut values: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if label_name == "__name__" {
-        for name in db.list_series_names() {
-            values.insert(name);
-        }
+///
+/// Optional `match[]`, `start`, `end`: same semantics as `handle_labels`; if start/end omitted,
+/// uses 0 to now for backward compatibility.
+pub fn handle_label_values(
+    label_name: &str,
+    match_params: &[String],
+    start_param: Option<&str>,
+    end_param: Option<&str>,
+    db: &Arc<DbCore>,
+) -> PrometheusApiResponse {
+    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => now_ns(),
+    };
+    let match_selectors: Option<&[String]> = if match_params.is_empty() {
+        None
     } else {
-        for (_, tags) in db.list_series_keys() {
-            if let Some(v) = tags.get(label_name) {
-                values.insert(v.clone());
-            }
+        Some(match_params)
+    };
+    match promql::label_values(db, label_name, match_selectors, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
+        }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    let mut data: Vec<String> = values.into_iter().collect();
-    data.sort();
-    PrometheusApiResponse::ok_json(data)
 }
 
 /// GET /api/v1/series?match[]=...&start=...&end=...
@@ -1122,7 +1143,7 @@ mod tests {
     #[test]
     fn label_values_name_returns_metric_names() {
         let (db, _guard) = make_db_with_series();
-        let r = handle_label_values("__name__", &db);
+        let r = handle_label_values("__name__", &[], None, None, &db);
         assert_eq!(r.status, StatusCode::OK);
         let s = String::from_utf8(r.body).unwrap();
         let body: ApiEnvelope<Vec<String>> = serde_json::from_str(&s).unwrap();
