@@ -1777,6 +1777,57 @@ mod tests {
         assert_eq!(http_sorted, lib_sorted, "handler labels must match library");
     }
 
+    /// Handler delegation: label values HTTP response matches library `label_values` (same set of values).
+    #[test]
+    fn handler_label_values_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result = crate::promql::label_values(&db, "job", None::<&[&str]>, start_ns, end_ns).unwrap();
+        let r = handle_label_values("job", &[], None, None, &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler label_values must match library");
+    }
+
+    /// Contract test: label_values with match[] and start/end — HTTP and library same inputs → identical results.
+    #[test]
+    fn handler_label_values_with_match_and_time_range_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let match_selectors = ["http_requests_total{job=\"api\"}".to_string()];
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let lib_result = crate::promql::label_values(
+            &db,
+            "job",
+            Some(match_selectors.as_slice()),
+            start_ns,
+            end_ns,
+        )
+        .unwrap();
+        let r = handle_label_values(
+            "job",
+            &match_selectors,
+            Some("1"),
+            Some("3"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler label_values with match and start/end must match library");
+    }
+
     /// Handler delegation: series HTTP response matches library `series` (same label sets).
     #[test]
     fn handler_series_matches_library() {
