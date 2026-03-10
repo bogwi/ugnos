@@ -54,8 +54,14 @@ impl From<DbError> for PromqlError {
 /// One sample in an instant-vector result: metric labels, timestamp (nanoseconds), and value.
 ///
 /// Same semantics as a single element of the `result` array in `GET /api/v1/query`
-/// when `resultType` is `vector`.
+/// when `resultType` is `vector`. This is the **programmatic contract** for instant query
+/// results; the library API is not tied to JSON. Callers consume `ts_ns` and `value` as
+/// Rust types (`u64`, `f64`) and `metric` as a label set.
+///
+/// **Stability:** Part of the stable PromQL library API; field layout and semantics follow
+/// semantic versioning.
 #[derive(Debug, Clone, PartialEq)]
+#[must_use]
 pub struct InstantSample {
     /// Metric labels including `__name__`.
     pub metric: HashMap<String, String>,
@@ -68,7 +74,8 @@ pub struct InstantSample {
 /// One series in a range (matrix) result: metric labels and step-aligned `(timestamp_ns, value)` pairs.
 ///
 /// Same semantics as a single element of the `result` array in `GET /api/v1/query_range`
-/// when `resultType` is `matrix`.
+/// when `resultType` is `matrix`. This is the **programmatic contract** for range query
+/// results; callers consume `metric` and `steps: Vec<(u64, f64)>` as Rust types, not JSON-only shapes.
 ///
 /// **Step invariant:** Each `(ts_ns, value)` in `steps` satisfies:
 /// - `ts_ns` is on the query grid: `ts_ns == start_ns + k * step_ns` for some `k`, with `start_ns <= ts_ns <= end_ns`.
@@ -76,7 +83,11 @@ pub struct InstantSample {
 /// - `steps` is a *subset* of the full grid: a grid time is omitted when the series has no value at that
 ///   evaluation time (e.g. no sample at or before that time for an instant selector). Thus different
 ///   series can have different `steps.len()`.
+///
+/// **Stability:** Part of the stable PromQL library API; field layout and semantics follow
+/// semantic versioning.
 #[derive(Debug, Clone, PartialEq)]
+#[must_use]
 pub struct RangeSeries {
     /// Metric labels including `__name__`.
     pub metric: HashMap<String, String>,
@@ -87,7 +98,10 @@ pub struct RangeSeries {
 /// Label set for a single series (metric name and labels).
 ///
 /// Same shape as one element of the `data` array in `GET /api/v1/series`: a map from label name
-/// to value, including `__name__` for the metric name.
+/// to value, including `__name__` for the metric name. This is the **programmatic contract** for
+/// series metadata; the library API exposes label sets as Rust types, not JSON-only shapes.
+///
+/// **Stability:** Part of the stable PromQL library API; semantics follow semantic versioning.
 pub type MetricLabels = HashMap<String, String>;
 
 /// Runs an instant query at a single evaluation time.
@@ -1422,5 +1436,135 @@ mod tests {
                 "same step count per series"
             );
         }
+    }
+
+    // --- Result type contracts (PromQL library API) ---
+    // Per Ugnos design: result types are public, stable programmatic
+    // contracts (InstantSample, RangeSeries, MetricLabels) with numeric timestamps/values and
+    // label sets as Rust types—not JSON-only. Tests follow time-series DB API contract testing
+    // practice: assert type shape, invariants, and programmatic use without relying on serialization.
+
+    /// Acceptance: result types expose numeric timestamps and values (ts_ns: u64, value: f64,
+    /// steps: Vec<(u64, f64)>) and label sets as Rust types; library API is not tied to JSON.
+    #[test]
+    fn result_types_expose_numeric_timestamps_and_values() {
+        let (db, _guard) = make_db_with_series();
+        let samples: Vec<InstantSample> =
+            query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        assert!(!samples.is_empty());
+        for s in &samples {
+            let _ts_ns: u64 = s.ts_ns;
+            let _value: f64 = s.value;
+            let _labels: &HashMap<String, String> = &s.metric;
+        }
+        let range_result: Vec<RangeSeries> = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(!range_result.is_empty());
+        for rs in &range_result {
+            let _steps: &[(u64, f64)] = &rs.steps;
+            let _metric: &HashMap<String, String> = &rs.metric;
+        }
+        let metrics: Vec<MetricLabels> =
+            super::series(&db, &["http_requests_total".to_string()], 0, 3_000_000_000).unwrap();
+        assert!(!metrics.is_empty());
+        for m in &metrics {
+            let _name: Option<&String> = m.get("__name__");
+            let _job: Option<&String> = m.get("job");
+        }
+    }
+
+    /// Contract: every InstantSample from query_instant has metric (label set), ts_ns (u64), value (f64).
+    #[test]
+    fn instant_sample_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let samples = query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        for s in &samples {
+            assert!(s.metric.contains_key("__name__"), "instant sample metric must include __name__");
+            assert!(s.ts_ns > 0, "ts_ns must be nonzero for real data");
+            // value can be any f64 including NaN/Inf per PromQL; we only check type is usable
+            let _: f64 = s.value;
+        }
+        // Empty result still yields Vec<InstantSample> with correct element type
+        let empty = query_instant(&db, "nonexistent_metric", 2_000_000_000).unwrap();
+        assert_eq!(empty.len(), 0);
+    }
+
+    /// Contract: every RangeSeries has metric and steps Vec<(u64, f64)>; steps strictly increasing and on grid.
+    #[test]
+    fn range_series_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+        let series = query_range(&db, "http_requests_total", start_ns, end_ns, step_ns).unwrap();
+        for rs in &series {
+            assert!(rs.metric.contains_key("__name__"), "range series metric must include __name__");
+            assert!(!rs.steps.is_empty(), "at least one step for this query");
+            let mut prev = 0u64;
+            for (ts, val) in &rs.steps {
+                assert!(ts >= &start_ns && ts <= &end_ns, "step on range");
+                assert!((ts - start_ns) % step_ns == 0, "step on grid");
+                assert!(*ts > prev, "steps strictly increasing");
+                prev = *ts;
+                let _: f64 = *val;
+            }
+        }
+    }
+
+    /// Contract: series() returns Vec<MetricLabels>; each element is a label set usable programmatically.
+    #[test]
+    fn metric_labels_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let metrics: Vec<MetricLabels> =
+            series(&db, &["http_requests_total".to_string()], 0, 3_000_000_000).unwrap();
+        assert_eq!(metrics.len(), 2, "api and web");
+        for m in &metrics {
+            assert!(m.contains_key("__name__"));
+            assert!(m.get("__name__") == Some(&"http_requests_total".to_string()));
+            let job = m.get("job").map(String::as_str);
+            assert!(job == Some("api") || job == Some("web"));
+        }
+    }
+
+    /// Programmatic construction: build InstantSample, RangeSeries, MetricLabels by hand; no JSON.
+    /// Ensures types are first-class Rust contracts and can be compared/used without serialization.
+    #[test]
+    fn result_types_programmatic_construction() {
+        let mut metric = HashMap::new();
+        metric.insert("__name__".to_string(), "http_requests_total".to_string());
+        metric.insert("job".to_string(), "api".to_string());
+        let sample = InstantSample {
+            metric: metric.clone(),
+            ts_ns: 2_000_000_000,
+            value: 20.0,
+        };
+        assert_eq!(sample.ts_ns, 2_000_000_000);
+        assert_eq!(sample.value, 20.0);
+        assert_eq!(sample.metric.get("job"), Some(&"api".to_string()));
+
+        let steps = vec![(1_000_000_000, 10.0), (2_000_000_000, 20.0)];
+        let range_series = RangeSeries {
+            metric: metric.clone(),
+            steps: steps.clone(),
+        };
+        assert_eq!(range_series.steps.len(), 2);
+        assert_eq!(range_series.steps[0], (1_000_000_000, 10.0));
+
+        let labels: MetricLabels = metric;
+        assert_eq!(labels.get("__name__"), Some(&"http_requests_total".to_string()));
+
+        // Compare with library output: one matching series from query_instant should equal our sample
+        let (db, _guard) = make_db_with_series();
+        let from_lib = query_instant(&db, r#"http_requests_total{job="api"}"#, 2_000_000_000).unwrap();
+        assert_eq!(from_lib.len(), 1);
+        assert_eq!(from_lib[0].ts_ns, sample.ts_ns);
+        assert_eq!(from_lib[0].value, sample.value);
+        assert_eq!(from_lib[0].metric.get("job"), sample.metric.get("job"));
     }
 }

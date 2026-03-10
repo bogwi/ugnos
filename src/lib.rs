@@ -58,6 +58,10 @@ pub use crate::types::Timestamp;
 /// Type alias for a value in a time series (f64).
 pub use crate::types::Value;
 
+// PromQL library API: stable result types and error (programmatic contracts, not JSON-only).
+pub use crate::promql::{MetricLabels, PromqlError};
+pub use crate::promql::{InstantSample, RangeSeries};
+
 // Default flush interval if not specified
 use std::time::Duration;
 /// The default interval between automatic buffer flushes (1 second).
