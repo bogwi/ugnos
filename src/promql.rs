@@ -523,6 +523,7 @@ fn metric_from_series_and_tags(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::error::Error;
 
     /// Builds a Db with known input series for instant-query tests (promtool-style input_series).
     /// Series: http_requests_total{job="api"} at 1s=10, 2s=20; http_requests_total{job="web"} at 1.5s=15.
@@ -840,6 +841,117 @@ mod tests {
         assert!(matches!(parse_err, PromqlError::Parse(_)));
         let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
         assert!(matches!(param_err, PromqlError::BadParameter(_)));
+    }
+
+    // --- PromqlError: variant distinction (acceptance: pattern match, no conflation) ---
+    // Tests align with time-series DB and PromQL testing practice: assert on expected error
+    // *type* (variant), not only that an error occurred, so callers can react without string matching.
+
+    /// Caller can distinguish Parse from BadParameter from Execution via pattern match;
+    /// parse vs parameter vs execution failures are not conflated.
+    #[test]
+    fn promql_error_parse_bad_parameter_execution_distinct() {
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "metric_a + metric_b", 2_000_000_000).unwrap_err();
+        let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        let exec_err =
+            PromqlError::Execution(crate::error::DbError::SeriesNotFound("test".to_string()));
+
+        assert!(matches!(parse_err, PromqlError::Parse(_)), "Parse must match Parse only");
+        assert!(!matches!(parse_err, PromqlError::BadParameter(_)));
+        assert!(!matches!(parse_err, PromqlError::Execution(_)));
+
+        assert!(matches!(param_err, PromqlError::BadParameter(_)), "BadParameter must match only");
+        assert!(!matches!(param_err, PromqlError::Parse(_)));
+        assert!(!matches!(param_err, PromqlError::Execution(_)));
+
+        assert!(matches!(exec_err, PromqlError::Execution(_)), "Execution must match Execution only");
+        assert!(!matches!(exec_err, PromqlError::Parse(_)));
+        assert!(!matches!(exec_err, PromqlError::BadParameter(_)));
+    }
+
+    /// Exhaustive match on PromqlError yields distinct outcomes; no variant conflated with another.
+    #[test]
+    fn promql_error_caller_can_match_exhaustively() {
+        fn variant_discriminant(e: &PromqlError) -> u8 {
+            match e {
+                PromqlError::Parse(_) => 0,
+                PromqlError::BadParameter(_) => 1,
+                PromqlError::Execution(_) => 2,
+            }
+        }
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "invalid {", 2_000_000_000).unwrap_err();
+        let param_err = query_range(&db, "", 1_000_000_000, 3_000_000_000, 0).unwrap_err();
+        let exec_err =
+            PromqlError::Execution(crate::error::DbError::Internal("test".to_string()));
+
+        assert_eq!(variant_discriminant(&parse_err), 0);
+        assert_eq!(variant_discriminant(&param_err), 1);
+        assert_eq!(variant_discriminant(&exec_err), 2);
+    }
+
+    /// Execution variant wraps DbError; source() is Some for Execution, None for Parse/BadParameter.
+    #[test]
+    fn promql_error_execution_variant_wraps_db_error_and_source() {
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "syntax [", 2_000_000_000).unwrap_err();
+        let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        let db_err = crate::error::DbError::InvalidTimeRange {
+            start: 2,
+            end: 1,
+        };
+        let exec_err = PromqlError::Execution(db_err);
+
+        assert!(parse_err.source().is_none());
+        assert!(param_err.source().is_none());
+        assert!(exec_err.source().is_some());
+        assert!(
+            exec_err.source().unwrap().downcast_ref::<crate::error::DbError>().is_some(),
+            "Execution source must be DbError"
+        );
+    }
+
+    /// All entry points that return PromqlError produce the expected variant for parse/param failures.
+    #[test]
+    fn promql_error_variants_from_labels_label_values_series_range() {
+        let (db, _guard) = make_db_with_series();
+        // Labels: BadParameter (start >= end), Parse (invalid match selector).
+        let err_bad = labels(&db, None::<&[String]>, 3_000_000_000, 1_000_000_000).unwrap_err();
+        let err_parse = labels(
+            &db,
+            Some(&["sum(rate(x[5m]))".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err_bad, PromqlError::BadParameter(_)));
+        assert!(matches!(err_parse, PromqlError::Parse(_)));
+
+        // Label values: same.
+        let err_bad_lv =
+            label_values(&db, "job", None::<&[String]>, 3_000_000_000, 1_000_000_000).unwrap_err();
+        assert!(matches!(err_bad_lv, PromqlError::BadParameter(_)));
+
+        // Series: BadParameter (empty match_selectors, start >= end), Parse (invalid selector).
+        let err_series_empty = series(&db, &[] as &[&str], 0, 3_000_000_000).unwrap_err();
+        let err_series_parse = series(
+            &db,
+            &["sum(metric)".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err_series_empty, PromqlError::BadParameter(_)));
+        assert!(matches!(err_series_parse, PromqlError::Parse(_)));
+
+        // Range: BadParameter (start >= end, step 0, empty query), Parse.
+        let err_range_param = query_range(&db, "x", 3_000_000_000, 1_000_000_000, 1_000_000_000)
+            .unwrap_err();
+        assert!(matches!(err_range_param, PromqlError::BadParameter(_)));
+        let err_range_parse =
+            query_range(&db, "a + b", 1_000_000_000, 3_000_000_000, 1_000_000_000).unwrap_err();
+        assert!(matches!(err_range_parse, PromqlError::Parse(_)));
     }
 
     // --- Labels: same semantics as GET /api/v1/labels (library-only, no HTTP) ---
