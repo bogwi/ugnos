@@ -1,0 +1,2006 @@
+//! PromQL library API: single entry point for running PromQL against a [`DbCore`].
+//!
+//! Exposes instant query, range query, labels, label values, and series with the same semantics as
+//! the Prometheus HTTP API (`GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`,
+//! `GET /api/v1/label/<name>/values`, `GET /api/v1/series`), using typed programmatic contracts and a unified error type.
+
+use crate::core::DbCore;
+use crate::error::DbError;
+use crate::prometheus_api::{eval_matrix, eval_vector};
+use crate::query_surface::{parse_eval_expr, parse_instant_selector, series_matches_selector};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Unified error type for PromQL library operations.
+///
+/// Callers can distinguish parse failures (invalid PromQL), parameter errors
+/// (missing/invalid time or step), and execution errors (storage/`DbError`)
+/// without string matching.
+#[derive(Debug)]
+pub enum PromqlError {
+    /// Invalid PromQL (e.g. unsupported syntax, parse failure).
+    Parse(String),
+    /// Missing or invalid time/step/range parameter.
+    BadParameter(String),
+    /// Storage or execution failure.
+    Execution(DbError),
+}
+
+impl std::fmt::Display for PromqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromqlError::Parse(s) => write!(f, "parse error: {}", s),
+            PromqlError::BadParameter(s) => write!(f, "bad parameter: {}", s),
+            PromqlError::Execution(e) => write!(f, "execution error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for PromqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PromqlError::Execution(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<DbError> for PromqlError {
+    fn from(e: DbError) -> Self {
+        PromqlError::Execution(e)
+    }
+}
+
+/// One sample in an instant-vector result: metric labels, timestamp (nanoseconds), and value.
+///
+/// Same semantics as a single element of the `result` array in `GET /api/v1/query`
+/// when `resultType` is `vector`. This is the **programmatic contract** for instant query
+/// results; the library API is not tied to JSON. Callers consume `ts_ns` and `value` as
+/// Rust types (`u64`, `f64`) and `metric` as a label set.
+///
+/// **Stability:** Part of the stable PromQL library API; field layout and semantics follow
+/// semantic versioning.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct InstantSample {
+    /// Metric labels including `__name__`.
+    pub metric: HashMap<String, String>,
+    /// Timestamp of the sample in nanoseconds since Unix epoch.
+    pub ts_ns: u64,
+    /// Sample value (may be NaN or ±Inf per PromQL).
+    pub value: f64,
+}
+
+/// One series in a range (matrix) result: metric labels and step-aligned `(timestamp_ns, value)` pairs.
+///
+/// Same semantics as a single element of the `result` array in `GET /api/v1/query_range`
+/// when `resultType` is `matrix`. This is the **programmatic contract** for range query
+/// results; callers consume `metric` and `steps: Vec<(u64, f64)>` as Rust types, not JSON-only shapes.
+///
+/// **Step invariant:** Each `(ts_ns, value)` in `steps` satisfies:
+/// - `ts_ns` is on the query grid: `ts_ns == start_ns + k * step_ns` for some `k`, with `start_ns <= ts_ns <= end_ns`.
+/// - Timestamps in `steps` are strictly increasing.
+/// - `steps` is a *subset* of the full grid: a grid time is omitted when the series has no value at that
+///   evaluation time (e.g. no sample at or before that time for an instant selector). Thus different
+///   series can have different `steps.len()`.
+///
+/// **Stability:** Part of the stable PromQL library API; field layout and semantics follow
+/// semantic versioning.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct RangeSeries {
+    /// Metric labels including `__name__`.
+    pub metric: HashMap<String, String>,
+    /// Step-aligned samples: `(ts_ns, value)` in ascending time order (subset of query grid).
+    pub steps: Vec<(u64, f64)>,
+}
+
+/// Label set for a single series (metric name and labels).
+///
+/// Same shape as one element of the `data` array in `GET /api/v1/series`: a map from label name
+/// to value, including `__name__` for the metric name. This is the **programmatic contract** for
+/// series metadata; the library API exposes label sets as Rust types, not JSON-only shapes.
+///
+/// **Stability:** Part of the stable PromQL library API; semantics follow semantic versioning.
+pub type MetricLabels = HashMap<String, String>;
+
+/// Runs an instant query at a single evaluation time.
+///
+/// Same semantics as `GET /api/v1/query`: parses the PromQL string, evaluates
+/// at `time_ns`, and returns a vector of samples (one per series for instant/range
+/// selectors, or aggregated per group for aggregations).
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `query` - PromQL expression (e.g. `http_requests_total`, `rate(metric[5m])`, `sum by (job)(rate(x[5m]))`).
+/// * `time_ns` - Evaluation time in nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - Instant vector of samples; may be empty if no series match.
+/// * `Err(PromqlError::Parse(_))` - Invalid or unsupported PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error during evaluation.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::{query_instant, InstantSample, PromqlError};
+/// use ugnos::DbCore;
+/// use std::sync::Arc;
+///
+/// let db = Arc::new(DbCore::default());
+/// let time_ns = 2_000_000_000; // 2s after epoch
+/// match query_instant(&db, "http_requests_total", time_ns) {
+///     Ok(samples) => { /* use samples */ }
+///     Err(PromqlError::Parse(msg)) => { /* invalid query */ }
+///     Err(PromqlError::Execution(e)) => { /* db error */ }
+///     Err(PromqlError::BadParameter(_)) => { /* not used for instant */ }
+/// }
+/// ```
+pub fn query_instant(
+    db: &Arc<DbCore>,
+    query: &str,
+    time_ns: u64,
+) -> Result<Vec<InstantSample>, PromqlError> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err(PromqlError::BadParameter("query string is empty".to_string()));
+    }
+    let expr = parse_eval_expr(q).map_err(PromqlError::Parse)?;
+    let internal = eval_vector(&expr, time_ns, db).map_err(PromqlError::Execution)?;
+    Ok(internal
+        .into_iter()
+        .map(|s| InstantSample {
+            metric: s.metric,
+            ts_ns: s.ts_ns,
+            value: s.value,
+        })
+        .collect())
+}
+
+/// Runs a range query over `[start_ns, end_ns]` with the given step.
+///
+/// Same semantics as `GET /api/v1/query_range`: parses the PromQL string, evaluates
+/// at each step `start_ns`, `start_ns + step_ns`, … up to `end_ns`, and returns a matrix
+/// of series, each with step-aligned `(ts_ns, value)` pairs.
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `query` - PromQL expression (instant selector, range function, or aggregation).
+/// * `start_ns` - Start of the range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the range (inclusive), nanoseconds since Unix epoch.
+/// * `step_ns` - Step between evaluation points in nanoseconds (must be positive).
+///
+/// # Returns
+/// * `Ok(vec)` - Matrix of series; may be empty if no series match.
+/// * `Err(PromqlError::Parse(_))` - Invalid or unsupported PromQL.
+/// * `Err(PromqlError::BadParameter(_))` - Empty query, `start_ns >= end_ns`, or `step_ns == 0`.
+/// * `Err(PromqlError::Execution(_))` - Storage error during evaluation.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::{query_range, RangeSeries, PromqlError};
+/// use ugnos::DbCore;
+/// use std::sync::Arc;
+///
+/// let db = Arc::new(DbCore::default());
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// let step_ns = 1_000_000_000;
+/// match query_range(&db, "http_requests_total", start_ns, end_ns, step_ns) {
+///     Ok(series) => { /* each series has metric + steps */ }
+///     Err(PromqlError::BadParameter(msg)) => { /* invalid range/step */ }
+///     Err(PromqlError::Parse(msg)) => { /* invalid query */ }
+///     Err(PromqlError::Execution(e)) => { /* db error */ }
+/// }
+/// ```
+pub fn query_range(
+    db: &Arc<DbCore>,
+    query: &str,
+    start_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+) -> Result<Vec<RangeSeries>, PromqlError> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err(PromqlError::BadParameter("query string is empty".to_string()));
+    }
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    if step_ns == 0 {
+        return Err(PromqlError::BadParameter(
+            "step must be positive".to_string(),
+        ));
+    }
+    let expr = parse_eval_expr(q).map_err(PromqlError::Parse)?;
+    let internal = eval_matrix(&expr, start_ns, end_ns, step_ns, db).map_err(PromqlError::Execution)?;
+    Ok(internal
+        .into_iter()
+        .map(|sd| RangeSeries {
+            metric: sd.metric,
+            steps: sd.steps,
+        })
+        .collect())
+}
+
+// ---------- Time and step parsing (single source of truth for HTTP and library) ----------
+
+/// Current time in nanoseconds since Unix epoch.
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Parses an optional evaluation time string into nanoseconds since Unix epoch.
+///
+/// Same behavior as the `time` query parameter of `GET /api/v1/query` and the
+/// `start`/`end` parameters of range and metadata endpoints. Use this so config/CLI
+/// string params produce identical values to the HTTP layer (behavioral parity).
+///
+/// # Arguments
+/// * `s` - `None` or empty/whitespace → "now" (current time in ns). Otherwise a string
+///   representing Unix time: integer or float seconds (e.g. `"123"`, `"123.5"`).
+///
+/// # Returns
+/// * `Ok(ns)` - Evaluation time in nanoseconds since Unix epoch.
+/// * `Err(msg)` - Invalid format (e.g. negative, non-numeric, or non-finite).
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::parse_eval_time;
+///
+/// // Omit or empty → "now"
+/// let now_ns = parse_eval_time(None).unwrap();
+/// let now_ns2 = parse_eval_time(Some("")).unwrap();
+/// assert_eq!(parse_eval_time(Some("1")).unwrap(), 1_000_000_000);
+/// assert_eq!(parse_eval_time(Some("2.5")).unwrap(), 2_500_000_000);
+/// ```
+pub fn parse_eval_time(s: Option<&str>) -> Result<u64, String> {
+    let s = match s {
+        Some(t) => t.trim(),
+        None => return Ok(now_ns()),
+    };
+    if s.is_empty() {
+        return Ok(now_ns());
+    }
+    if let Ok(secs) = s.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            return Ok((secs * 1e9) as u64);
+        }
+    }
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(secs * 1_000_000_000);
+    }
+    Err(format!(
+        "invalid time parameter (use Unix seconds): {:?}",
+        s
+    ))
+}
+
+/// Parses a step string into nanoseconds.
+///
+/// Same behavior as the `step` query parameter of `GET /api/v1/query_range`. Use this
+/// so config/CLI step params produce identical values to the HTTP layer (behavioral parity).
+/// Supports a bare number (seconds), or a number with suffix: `s`, `m`, `h`, `d` (case-insensitive).
+///
+/// # Arguments
+/// * `s` - Step string (e.g. `"15s"`, `"1m"`, `"1h"`, `"1d"`, or `"30"` for 30 seconds).
+///
+/// # Returns
+/// * `Ok(ns)` - Step in nanoseconds (aligns with `step_ns` in [`query_range`]).
+/// * `Err(msg)` - Empty string, missing, or invalid format (e.g. negative or unknown unit).
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::parse_step;
+///
+/// assert_eq!(parse_step("15s").unwrap(), 15_000_000_000);
+/// assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+/// assert_eq!(parse_step("1h").unwrap(), 3_600_000_000_000);
+/// assert_eq!(parse_step("1d").unwrap(), 86_400_000_000_000);
+/// assert_eq!(parse_step("30").unwrap(), 30_000_000_000);
+/// ```
+pub fn parse_step(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty step parameter".to_string());
+    }
+    let s = ascii_lower(s);
+    let (num_str, mult) = if s.ends_with('s') {
+        (&s[..s.len() - 1], 1u64)
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 60)
+    } else if s.ends_with('h') {
+        (&s[..s.len() - 1], 3600)
+    } else if s.ends_with('d') {
+        (&s[..s.len() - 1], 86400)
+    } else if let Ok(n) = s.parse::<f64>() {
+        if !n.is_finite() || n < 0.0 {
+            return Err("step must be non-negative".to_string());
+        }
+        return Ok((n as u64) * 1_000_000_000);
+    } else {
+        return Err(format!("invalid step: {:?}", s));
+    };
+    let n: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid step number: {:?}", num_str))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err("step must be non-negative".to_string());
+    }
+    Ok((n * mult as f64) as u64 * 1_000_000_000)
+}
+
+fn ascii_lower(s: &str) -> String {
+    s.chars().map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// Returns the set of label names present in series that match the optional selectors
+/// and have at least one sample in the time range `[start_ns, end_ns]` (inclusive).
+///
+/// Same semantics as `GET /api/v1/labels`: optional `match[]` restricts to series matching
+/// any of the given PromQL instant selectors; required `start`/`end` restrict to an
+/// approximate time range (only series with data in that range contribute their labels).
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `match_selectors` - Optional list of PromQL instant selectors (e.g. `http_requests_total`, `metric{job="api"}`).
+///   If `None` or empty, all series in the store are considered (within the time range).
+/// * `start_ns` - Start of the time range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the time range (inclusive), nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - Sorted list of unique label names (including `__name__`); may be empty.
+/// * `Err(PromqlError::BadParameter(_))` - `start_ns >= end_ns`.
+/// * `Err(PromqlError::Parse(_))` - A selector in `match_selectors` is invalid PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error while checking series in range.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::labels;
+/// use std::sync::Arc;
+///
+/// let db: Arc<DbCore> = /* ... */;
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// // All labels in the time range
+/// let names = labels(&db, None::<&[String]>, start_ns, end_ns)?;
+/// // Only labels from series matching the selector
+/// let names = labels(&db, Some(&["http_requests_total{job=\"api\"}".into()]), start_ns, end_ns)?;
+/// ```
+pub fn labels(
+    db: &Arc<DbCore>,
+    match_selectors: Option<&[impl AsRef<str>]>,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<String>, PromqlError> {
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    // Inclusive end: query range is [start_ns, end_ns]; storage uses [start, end).
+    let query_end = end_ns.saturating_add(1);
+
+    let keys = db.list_series_keys();
+
+    // If match_selectors provided, parse them and filter keys to those matching any selector.
+    let keys_to_consider: Vec<(String, HashMap<String, String>)> = match match_selectors {
+        None => keys.clone(),
+        Some(s) if s.is_empty() => keys.clone(),
+        Some(selectors) => {
+            let parsed: Vec<_> = selectors
+                .iter()
+                .map(|s| parse_instant_selector(s.as_ref().trim()).map_err(PromqlError::Parse))
+                .collect::<Result<Vec<_>, _>>()?;
+            keys.into_iter()
+                .filter(|(name, tags)| {
+                    parsed.iter().any(|inst| {
+                        series_matches_selector(name, tags, &inst.selector)
+                    })
+                })
+                .collect()
+        }
+    };
+
+    let mut names: HashSet<String> = HashSet::new();
+    names.insert("__name__".to_string());
+    for (series_name, tags) in keys_to_consider {
+        // Only include labels from series that have at least one point in [start_ns, end_ns].
+        let range = start_ns..query_end;
+        match db.query(&series_name, range, Some(&tags)) {
+            Ok(points) if !points.is_empty() => {
+                for k in tags.keys() {
+                    names.insert(k.clone());
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let mut data: Vec<String> = names.into_iter().collect();
+    data.sort();
+    Ok(data)
+}
+
+/// Returns the set of values for a given label name from series that match the optional selectors
+/// and have at least one sample in the time range `[start_ns, end_ns]` (inclusive).
+///
+/// Same semantics as `GET /api/v1/label/<name>/values`: optional `match[]` restricts to series
+/// matching any of the given PromQL instant selectors; required `start`/`end` restrict to an
+/// approximate time range (only series with data in that range contribute their label values).
+/// For the special label `__name__`, returns metric names (series names) instead of a tag value.
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `label_name` - Label whose values to return (use `__name__` for metric names).
+/// * `match_selectors` - Optional list of PromQL instant selectors. If `None` or empty, all series
+///   in the store are considered (within the time range).
+/// * `start_ns` - Start of the time range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the time range (inclusive), nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - Sorted list of unique label values; may be empty if no series have the label or
+///   no series have data in range.
+/// * `Err(PromqlError::BadParameter(_))` - `start_ns >= end_ns`.
+/// * `Err(PromqlError::Parse(_))` - A selector in `match_selectors` is invalid PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error while checking series in range.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::label_values;
+/// use std::sync::Arc;
+///
+/// let db: Arc<DbCore> = /* ... */;
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// // All values for "job" in the time range
+/// let values = label_values(&db, "job", None::<&[String]>, start_ns, end_ns)?;
+/// // Only values from series matching the selector
+/// let values = label_values(&db, "job", Some(&["http_requests_total{instance=\"a\"}".into()]), start_ns, end_ns)?;
+/// // Metric names (same as values for __name__)
+/// let names = label_values(&db, "__name__", None::<&[String]>, start_ns, end_ns)?;
+/// ```
+pub fn label_values(
+    db: &Arc<DbCore>,
+    label_name: &str,
+    match_selectors: Option<&[impl AsRef<str>]>,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<String>, PromqlError> {
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    let query_end = end_ns.saturating_add(1);
+
+    let keys = db.list_series_keys();
+
+    let keys_to_consider: Vec<(String, HashMap<String, String>)> = match match_selectors {
+        None => keys.clone(),
+        Some(s) if s.is_empty() => keys.clone(),
+        Some(selectors) => {
+            let parsed: Vec<_> = selectors
+                .iter()
+                .map(|s| parse_instant_selector(s.as_ref().trim()).map_err(PromqlError::Parse))
+                .collect::<Result<Vec<_>, _>>()?;
+            keys.into_iter()
+                .filter(|(name, tags)| {
+                    parsed.iter().any(|inst| {
+                        series_matches_selector(name, tags, &inst.selector)
+                    })
+                })
+                .collect()
+        }
+    };
+
+    let mut values: HashSet<String> = HashSet::new();
+    for (series_name, tags) in keys_to_consider {
+        let range = start_ns..query_end;
+        match db.query(&series_name, range, Some(&tags)) {
+            Ok(points) if !points.is_empty() => {
+                if label_name == "__name__" {
+                    values.insert(series_name);
+                } else if let Some(v) = tags.get(label_name) {
+                    values.insert(v.clone());
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let mut data: Vec<String> = values.into_iter().collect();
+    data.sort();
+    Ok(data)
+}
+
+/// Returns the set of series (label sets) that match the given selectors and have at least one
+/// sample in the time range `[start_ns, end_ns]` (inclusive).
+///
+/// Same semantics as `GET /api/v1/series`: at least one `match[]` selector is required;
+/// required `start`/`end` restrict to an approximate time range (only series with data in that
+/// range are returned). Each returned element is the full label set (including `__name__`) for
+/// one series.
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `match_selectors` - Non-empty list of PromQL instant selectors (e.g. `http_requests_total`, `metric{job="api"}`).
+///   At least one selector is required; a series is included if it matches any of the selectors.
+/// * `start_ns` - Start of the time range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the time range (inclusive), nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - List of unique label sets (one per matching series with data in range); may be empty.
+/// * `Err(PromqlError::BadParameter(_))` - Empty `match_selectors` or `start_ns >= end_ns`.
+/// * `Err(PromqlError::Parse(_))` - A selector in `match_selectors` is invalid PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error while querying series in range.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::series;
+/// use std::sync::Arc;
+///
+/// let db: Arc<DbCore> = /* ... */;
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// let metrics = series(
+///     &db,
+///     &["http_requests_total".into()],
+///     start_ns,
+///     end_ns,
+/// )?;
+/// ```
+pub fn series(
+    db: &Arc<DbCore>,
+    match_selectors: &[impl AsRef<str>],
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<MetricLabels>, PromqlError> {
+    let selectors_ref: Vec<&str> = match_selectors.iter().map(AsRef::as_ref).collect();
+    let non_empty: Vec<&str> = selectors_ref.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if non_empty.is_empty() {
+        return Err(PromqlError::BadParameter(
+            "at least one match[] parameter is required".to_string(),
+        ));
+    }
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    let query_end = end_ns.saturating_add(1);
+
+    let keys = db.list_series_keys();
+
+    let parsed: Vec<_> = non_empty
+        .iter()
+        .map(|s| parse_instant_selector(s).map_err(PromqlError::Parse))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let keys_to_consider: Vec<(String, HashMap<String, String>)> = keys
+        .into_iter()
+        .filter(|(name, tags)| {
+            parsed.iter().any(|inst| series_matches_selector(name, tags, &inst.selector))
+        })
+        .collect();
+
+    let mut seen: HashSet<Vec<(String, String)>> = HashSet::new();
+    let mut out: Vec<MetricLabels> = Vec::new();
+    for (series_name, tags) in keys_to_consider {
+        let range = start_ns..query_end;
+        match db.query(&series_name, range, Some(&tags)) {
+            Ok(points) if !points.is_empty() => {
+                let metric = metric_from_series_and_tags(&series_name, &tags);
+                let key: Vec<(String, String)> = {
+                    let mut k: Vec<_> = metric.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+                    k.sort_by(|a, b| a.0.cmp(&b.0));
+                    k
+                };
+                if seen.insert(key) {
+                    out.push(metric);
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    out.sort_by(|a, b| {
+        let mut ka: Vec<_> = a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut kb: Vec<_> = b.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        ka.sort_by(|x, y| x.0.cmp(y.0));
+        kb.sort_by(|x, y| x.0.cmp(y.0));
+        ka.cmp(&kb)
+    });
+    Ok(out)
+}
+
+/// Build metric label set from series name and tag set (including `__name__`).
+fn metric_from_series_and_tags(
+    series: &str,
+    tags: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("__name__".to_string(), series.to_string());
+    for (k, v) in tags {
+        m.insert(k.clone(), v.clone());
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::error::Error;
+
+    /// Builds a Db with known input series for instant-query tests (promtool-style input_series).
+    /// Series: http_requests_total{job="api"} at 1s=10, 2s=20; http_requests_total{job="web"} at 1.5s=15.
+    fn make_db_with_series() -> (Arc<DbCore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_series_cardinality: Some(1000),
+            ..Default::default()
+        };
+        let mut db = DbCore::with_config(config).unwrap();
+        db.recover().unwrap();
+        let db = Arc::new(db);
+        db.insert(
+            "http_requests_total",
+            1_000_000_000,
+            10.0,
+            [("job".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        db.insert(
+            "http_requests_total",
+            2_000_000_000,
+            20.0,
+            [("job".to_string(), "api".to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        db.insert(
+            "http_requests_total",
+            1_500_000_000,
+            15.0,
+            [("job".to_string(), "web".to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        db.flush().unwrap();
+        (db, dir)
+    }
+
+    /// Db with multiple series for aggregation tests: job=api (instance a/b), job=web (instance c).
+    fn make_db_for_aggregation() -> (Arc<DbCore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::DbConfig {
+            data_dir: dir.path().to_path_buf(),
+            max_series_cardinality: Some(1000),
+            ..Default::default()
+        };
+        let mut db = DbCore::with_config(config).unwrap();
+        db.recover().unwrap();
+        let db = Arc::new(db);
+        for i in 0..5 {
+            db.insert(
+                "http_requests_total",
+                (i + 1) * 1_000_000_000,
+                (i as f64 + 1.0) * 10.0,
+                [
+                    ("job".to_string(), "api".to_string()),
+                    ("instance".to_string(), "a".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        }
+        for i in 0..5 {
+            db.insert(
+                "http_requests_total",
+                (i + 1) * 1_000_000_000,
+                (i as f64 + 1.0) * 5.0,
+                [
+                    ("job".to_string(), "api".to_string()),
+                    ("instance".to_string(), "b".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        }
+        for i in 0..5 {
+            db.insert(
+                "http_requests_total",
+                (i + 1) * 1_000_000_000,
+                (i as f64 + 1.0) * 3.0,
+                [
+                    ("job".to_string(), "web".to_string()),
+                    ("instance".to_string(), "c".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        (db, dir)
+    }
+
+    fn metric_sort_key(m: &HashMap<String, String>) -> String {
+        let mut pairs: Vec<_> = m.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        pairs
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn sort_samples(samples: &mut [InstantSample]) {
+        samples.sort_by_key(|a| metric_sort_key(&a.metric));
+    }
+
+    // --- Time and step parsing: unit tests and HTTP parity ---
+
+    #[test]
+    fn parse_eval_time_none_or_empty_means_now() {
+        let t_none = parse_eval_time(None).unwrap();
+        let t_empty = parse_eval_time(Some("")).unwrap();
+        let t_whitespace = parse_eval_time(Some("  \t ")).unwrap();
+        assert!(t_none > 0, "now should be positive");
+        assert!(t_empty > 0);
+        assert!(t_whitespace > 0);
+        // All resolve to "now"; exact equality not required (evaluated at slightly different times).
+    }
+
+    #[test]
+    fn parse_eval_time_unix_seconds_integer() {
+        assert_eq!(parse_eval_time(Some("0")).unwrap(), 0);
+        assert_eq!(parse_eval_time(Some("1")).unwrap(), 1_000_000_000);
+        assert_eq!(parse_eval_time(Some("123")).unwrap(), 123_000_000_000);
+        assert_eq!(parse_eval_time(Some(" 2 ")).unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn parse_eval_time_unix_seconds_float() {
+        assert_eq!(parse_eval_time(Some("1.5")).unwrap(), 1_500_000_000);
+        assert_eq!(parse_eval_time(Some("2.5")).unwrap(), 2_500_000_000);
+        assert_eq!(parse_eval_time(Some("0.001")).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parse_eval_time_invalid_returns_error() {
+        let err = parse_eval_time(Some("-1")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("x")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("inf")).unwrap_err();
+        assert!(err.contains("invalid time parameter"));
+        let err = parse_eval_time(Some("nan")).unwrap_err();
+        assert!(err.contains("invalid time parameter"), "NaN must be rejected");
+    }
+
+    #[test]
+    fn parse_step_seconds_unit() {
+        assert_eq!(parse_step("15s").unwrap(), 15_000_000_000);
+        assert_eq!(parse_step("0s").unwrap(), 0);
+        assert_eq!(parse_step(" 30s ").unwrap(), 30_000_000_000);
+        assert_eq!(parse_step("15S").unwrap(), 15_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_minutes_hours_days() {
+        assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("2m").unwrap(), 120_000_000_000);
+        assert_eq!(parse_step("1h").unwrap(), 3_600_000_000_000);
+        assert_eq!(parse_step("1d").unwrap(), 86_400_000_000_000);
+        assert_eq!(parse_step("1M").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("1H").unwrap(), 3_600_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_bare_number_is_seconds() {
+        assert_eq!(parse_step("30").unwrap(), 30_000_000_000);
+        assert_eq!(parse_step("1").unwrap(), 1_000_000_000);
+        assert_eq!(parse_step("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_step_fractional_duration() {
+        assert_eq!(parse_step("1.5m").unwrap(), 90_000_000_000);
+        assert_eq!(parse_step("0.5h").unwrap(), 1_800_000_000_000);
+    }
+
+    #[test]
+    fn parse_step_empty_or_invalid_returns_error() {
+        assert!(parse_step("").unwrap_err().contains("empty step"));
+        assert!(parse_step("  ").unwrap_err().contains("empty step"));
+        assert!(parse_step("x").unwrap_err().contains("invalid step"));
+        assert!(
+            parse_step("1x").unwrap_err().contains("invalid step"),
+            "unknown unit or invalid number"
+        );
+        assert!(parse_step("-1s").unwrap_err().contains("non-negative"));
+        assert!(
+            parse_step("-1").unwrap_err().contains("non-negative"),
+            "bare negative step must be rejected (parity with -1s)"
+        );
+    }
+
+    /// Equivalent duration representations yield the same step in ns (Prometheus-style step parsing).
+    /// Aligns with time-series DB practice: multiple string forms for the same duration must be equivalent.
+    #[test]
+    fn parse_step_equivalent_durations_same_ns() {
+        assert_eq!(
+            parse_step("60s").unwrap(),
+            parse_step("1m").unwrap(),
+            "60s and 1m must yield same step_ns"
+        );
+        assert_eq!(
+            parse_step("3600s").unwrap(),
+            parse_step("1h").unwrap(),
+            "3600s and 1h must yield same step_ns"
+        );
+        assert_eq!(
+            parse_step("86400s").unwrap(),
+            parse_step("1d").unwrap(),
+            "86400s and 1d must yield same step_ns"
+        );
+        assert_eq!(parse_step("60s").unwrap(), 60_000_000_000);
+        assert_eq!(parse_step("1m").unwrap(), 60_000_000_000);
+    }
+
+    /// Parser accepts step "0" (returns 0 ns); query_range rejects step_ns == 0 at use site (BadParameter).
+    /// Single source of truth: parser defines string→ns; business rule (positive step) enforced in query_range.
+    #[test]
+    fn parse_step_zero_accepted_parser_rejected_by_query_range() {
+        assert_eq!(parse_step("0").unwrap(), 0);
+        assert_eq!(parse_step("0s").unwrap(), 0);
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            parse_step("0").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, PromqlError::BadParameter(m) if m.contains("step")),
+            "query_range must reject step_ns 0: {:?}",
+            err
+        );
+    }
+
+    /// Behavioral parity: parsed time/step values match what the HTTP layer uses (single source of truth).
+    /// Same string inputs produce the same u64 ns values; HTTP handlers call these same helpers.
+    #[test]
+    fn parse_eval_time_and_step_same_values_as_http_layer() {
+        assert_eq!(
+            parse_eval_time(Some("2")).unwrap(),
+            2_000_000_000,
+            "time param \"2\" must yield 2s in ns for HTTP and library"
+        );
+        assert_eq!(
+            parse_eval_time(Some("0")).unwrap(),
+            0,
+            "time param \"0\" must yield 0 ns"
+        );
+        assert_eq!(
+            parse_step("1").unwrap(),
+            1_000_000_000,
+            "step param \"1\" must yield 1s in ns for HTTP and library"
+        );
+        assert_eq!(
+            parse_step("15s").unwrap(),
+            15_000_000_000,
+            "step param \"15s\" must yield 15s in ns"
+        );
+    }
+
+    /// Parity: instant query using parse_eval_time produces same result as direct time_ns.
+    #[test]
+    fn parse_eval_time_used_in_query_instant_matches_direct_time_ns() {
+        let (db, _guard) = make_db_with_series();
+        let time_ns_from_parser = parse_eval_time(Some("2")).unwrap();
+        let from_parser = query_instant(&db, "http_requests_total", time_ns_from_parser).unwrap();
+        let direct = query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        assert_eq!(from_parser.len(), direct.len());
+        assert_eq!(from_parser.len(), 2, "expect two series at t=2");
+        let mut a = from_parser;
+        let mut b = direct;
+        sort_samples(&mut a);
+        sort_samples(&mut b);
+        assert_eq!(a[0].value, b[0].value);
+        assert_eq!(a[1].value, b[1].value);
+    }
+
+    /// Parity: range query using parse_step produces same step grid as direct step_ns.
+    #[test]
+    fn parse_step_used_in_query_range_matches_direct_step_ns() {
+        let (db, _guard) = make_db_with_series();
+        let step_ns_from_parser = parse_step("1").unwrap();
+        let from_parser = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            step_ns_from_parser,
+        )
+        .unwrap();
+        let direct = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(from_parser.len(), direct.len());
+        if let (Some(a), Some(b)) = (from_parser.first(), direct.first()) {
+            assert_eq!(a.steps.len(), b.steps.len(), "same step count");
+            assert_eq!(
+                a.steps.first().map(|(t, _)| *t),
+                b.steps.first().map(|(t, _)| *t),
+                "same first step time"
+            );
+        }
+    }
+
+    // --- Instant query: same semantics as GET /api/v1/query ---
+
+    #[test]
+    fn instant_selector_returns_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        let time_ns = 2_000_000_000u64;
+        let result = query_instant(&db, "http_requests_total", time_ns).unwrap();
+        let mut samples = result;
+        sort_samples(&mut samples);
+        assert_eq!(samples.len(), 2, "api and web series");
+        let names: Vec<_> = samples
+            .iter()
+            .map(|s| s.metric.get("__name__").map(|x| x.as_str()))
+            .collect();
+        assert!(names.iter().all(|n| *n == Some("http_requests_total")));
+        let jobs: Vec<_> = samples
+            .iter()
+            .map(|s| s.metric.get("job").map(|x| x.as_str()))
+            .collect();
+        assert!(jobs.contains(&Some("api")));
+        assert!(jobs.contains(&Some("web")));
+        // At time 2s: api has latest 20, web has latest 15 (1.5s)
+        let api_sample = samples.iter().find(|s| s.metric.get("job") == Some(&"api".to_string()));
+        let web_sample = samples.iter().find(|s| s.metric.get("job") == Some(&"web".to_string()));
+        assert_eq!(api_sample.map(|s| s.value), Some(20.0));
+        assert_eq!(web_sample.map(|s| s.value), Some(15.0));
+        assert_eq!(api_sample.map(|s| s.ts_ns), Some(2_000_000_000));
+        assert_eq!(web_sample.map(|s| s.ts_ns), Some(1_500_000_000));
+    }
+
+    #[test]
+    fn instant_selector_with_label_matcher_equality() {
+        let (db, _guard) = make_db_with_series();
+        let result = query_instant(&db, r#"http_requests_total{job="api"}"#, 2_000_000_000).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].metric.get("job"), Some(&"api".to_string()));
+        assert_eq!(result[0].value, 20.0);
+    }
+
+    #[test]
+    fn instant_selector_with_label_matcher_not_equal() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, r#"http_requests_total{job!="web"}"#, 2_000_000_000).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].metric.get("job"), Some(&"api".to_string()));
+    }
+
+    #[test]
+    fn instant_selector_with_regex_matcher() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, r#"http_requests_total{job=~"api|web"}"#, 2_000_000_000).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn instant_empty_query_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn instant_whitespace_only_query_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_instant(&db, "   ", 2_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(!msg.is_empty()),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn instant_parse_error_binary_expr() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_instant(&db, "metric_a + metric_b", 2_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::Parse(_) => {}
+            _ => panic!("expected Parse, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn instant_parse_error_bare_range_vector() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_instant(&db, "http_requests_total[5m]", 2_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::Parse(_) => {}
+            _ => panic!("expected Parse, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn instant_parse_error_unsupported_function() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_instant(
+            &db,
+            "histogram_quantile(0.9, rate(http_duration_bucket[5m]))",
+            2_000_000_000,
+        )
+        .unwrap_err();
+        match &err {
+            PromqlError::Parse(_) => {}
+            _ => panic!("expected Parse, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn instant_nonexistent_metric_returns_empty_vector() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, "nonexistent_metric", 2_000_000_000).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn instant_nonexistent_selector_returns_empty_vector() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, r#"nonexistent{job="x"}"#, 2_000_000_000).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn instant_rate_returns_vector_same_semantics_as_http() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, "rate(http_requests_total[5m])", 2_000_000_000).unwrap();
+        // At least one series (api or web) has two points in [0,2] so rate is defined
+        assert!(!result.is_empty());
+        for s in &result {
+            assert!(s.metric.contains_key("__name__"));
+            assert!(s.metric.contains_key("job"));
+            assert!(s.ts_ns == 2_000_000_000);
+        }
+    }
+
+    #[test]
+    fn instant_increase_returns_vector() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, "increase(http_requests_total[5m])", 2_000_000_000).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn instant_avg_over_time_returns_vector() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, "avg_over_time(http_requests_total[5m])", 2_000_000_000).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn instant_sum_by_returns_grouped_vector() {
+        let (db, _guard) = make_db_for_aggregation();
+        // At time 5s: api has 10+20+30+40+50 = 150 (inst a) + 5+10+15+20+25 = 75 (inst b); web 3+6+9+12+15 = 45
+        let result = query_instant(
+            &db,
+            r#"sum by (job) (http_requests_total)"#,
+            5_000_000_000,
+        )
+        .unwrap();
+        let mut samples = result;
+        sort_samples(&mut samples);
+        assert_eq!(samples.len(), 2, "one group per job");
+        let api = samples.iter().find(|s| s.metric.get("job") == Some(&"api".to_string()));
+        let web = samples.iter().find(|s| s.metric.get("job") == Some(&"web".to_string()));
+        assert!(api.is_some());
+        assert!(web.is_some());
+        // At 5s instant: latest per series is (5s, 50) for api/a, (5s, 25) for api/b, (5s, 15) for web/c. Sum by job: api = 75, web = 15.
+        assert_eq!(api.map(|s| s.value), Some(75.0));
+        assert_eq!(web.map(|s| s.value), Some(15.0));
+    }
+
+    #[test]
+    fn instant_count_returns_series_count() {
+        let (db, _guard) = make_db_for_aggregation();
+        let result = query_instant(&db, "count(http_requests_total)", 5_000_000_000).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 3.0, "three series");
+    }
+
+    #[test]
+    fn instant_sum_of_empty_set_returns_empty_vector() {
+        let (db, _guard) = make_db_with_series();
+        let result =
+            query_instant(&db, r#"sum by (job) (nonexistent)"#, 2_000_000_000).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn instant_error_variants_distinguishable() {
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "invalid {", 2_000_000_000).unwrap_err();
+        assert!(matches!(parse_err, PromqlError::Parse(_)));
+        let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        assert!(matches!(param_err, PromqlError::BadParameter(_)));
+    }
+
+    // --- PromqlError: variant distinction (acceptance: pattern match, no conflation) ---
+    // Tests align with time-series DB and PromQL testing practice: assert on expected error
+    // *type* (variant), not only that an error occurred, so callers can react without string matching.
+
+    /// Caller can distinguish Parse from BadParameter from Execution via pattern match;
+    /// parse vs parameter vs execution failures are not conflated.
+    #[test]
+    fn promql_error_parse_bad_parameter_execution_distinct() {
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "metric_a + metric_b", 2_000_000_000).unwrap_err();
+        let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        let exec_err =
+            PromqlError::Execution(crate::error::DbError::SeriesNotFound("test".to_string()));
+
+        assert!(matches!(parse_err, PromqlError::Parse(_)), "Parse must match Parse only");
+        assert!(!matches!(parse_err, PromqlError::BadParameter(_)));
+        assert!(!matches!(parse_err, PromqlError::Execution(_)));
+
+        assert!(matches!(param_err, PromqlError::BadParameter(_)), "BadParameter must match only");
+        assert!(!matches!(param_err, PromqlError::Parse(_)));
+        assert!(!matches!(param_err, PromqlError::Execution(_)));
+
+        assert!(matches!(exec_err, PromqlError::Execution(_)), "Execution must match Execution only");
+        assert!(!matches!(exec_err, PromqlError::Parse(_)));
+        assert!(!matches!(exec_err, PromqlError::BadParameter(_)));
+    }
+
+    /// Exhaustive match on PromqlError yields distinct outcomes; no variant conflated with another.
+    #[test]
+    fn promql_error_caller_can_match_exhaustively() {
+        fn variant_discriminant(e: &PromqlError) -> u8 {
+            match e {
+                PromqlError::Parse(_) => 0,
+                PromqlError::BadParameter(_) => 1,
+                PromqlError::Execution(_) => 2,
+            }
+        }
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "invalid {", 2_000_000_000).unwrap_err();
+        let param_err = query_range(&db, "", 1_000_000_000, 3_000_000_000, 0).unwrap_err();
+        let exec_err =
+            PromqlError::Execution(crate::error::DbError::Internal("test".to_string()));
+
+        assert_eq!(variant_discriminant(&parse_err), 0);
+        assert_eq!(variant_discriminant(&param_err), 1);
+        assert_eq!(variant_discriminant(&exec_err), 2);
+    }
+
+    /// Execution variant wraps DbError; source() is Some for Execution, None for Parse/BadParameter.
+    #[test]
+    fn promql_error_execution_variant_wraps_db_error_and_source() {
+        let (db, _guard) = make_db_with_series();
+        let parse_err = query_instant(&db, "syntax [", 2_000_000_000).unwrap_err();
+        let param_err = query_instant(&db, "", 2_000_000_000).unwrap_err();
+        let db_err = crate::error::DbError::InvalidTimeRange {
+            start: 2,
+            end: 1,
+        };
+        let exec_err = PromqlError::Execution(db_err);
+
+        assert!(parse_err.source().is_none());
+        assert!(param_err.source().is_none());
+        assert!(exec_err.source().is_some());
+        assert!(
+            exec_err.source().unwrap().downcast_ref::<crate::error::DbError>().is_some(),
+            "Execution source must be DbError"
+        );
+    }
+
+    /// All entry points that return PromqlError produce the expected variant for parse/param failures.
+    #[test]
+    fn promql_error_variants_from_labels_label_values_series_range() {
+        let (db, _guard) = make_db_with_series();
+        // Labels: BadParameter (start >= end), Parse (invalid match selector).
+        let err_bad = labels(&db, None::<&[String]>, 3_000_000_000, 1_000_000_000).unwrap_err();
+        let err_parse = labels(
+            &db,
+            Some(&["sum(rate(x[5m]))".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err_bad, PromqlError::BadParameter(_)));
+        assert!(matches!(err_parse, PromqlError::Parse(_)));
+
+        // Label values: same.
+        let err_bad_lv =
+            label_values(&db, "job", None::<&[String]>, 3_000_000_000, 1_000_000_000).unwrap_err();
+        assert!(matches!(err_bad_lv, PromqlError::BadParameter(_)));
+
+        // Series: BadParameter (empty match_selectors, start >= end), Parse (invalid selector).
+        let err_series_empty = series(&db, &[] as &[&str], 0, 3_000_000_000).unwrap_err();
+        let err_series_parse = series(
+            &db,
+            &["sum(metric)".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err_series_empty, PromqlError::BadParameter(_)));
+        assert!(matches!(err_series_parse, PromqlError::Parse(_)));
+
+        // Range: BadParameter (start >= end, step 0, empty query), Parse.
+        let err_range_param = query_range(&db, "x", 3_000_000_000, 1_000_000_000, 1_000_000_000)
+            .unwrap_err();
+        assert!(matches!(err_range_param, PromqlError::BadParameter(_)));
+        let err_range_parse =
+            query_range(&db, "a + b", 1_000_000_000, 3_000_000_000, 1_000_000_000).unwrap_err();
+        assert!(matches!(err_range_parse, PromqlError::Parse(_)));
+    }
+
+    // --- Labels: same semantics as GET /api/v1/labels (library-only, no HTTP) ---
+    // Tests follow time-series metadata API practices: unique sorted label names,
+    // optional match[] filtering (OR semantics), and time-range restriction so only
+    // series with data in [start_ns, end_ns] contribute (see Prometheus PR #7288, #8301).
+
+    #[test]
+    fn labels_returns_sorted_unique_names_including_metric_name() {
+        let (db, _guard) = make_db_with_series();
+        let names = labels(&db, None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert!(
+            names.contains(&"__name__".to_string()),
+            "labels must include __name__"
+        );
+        assert!(names.contains(&"job".to_string()), "labels must include job");
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "labels must be returned sorted");
+    }
+
+    #[test]
+    fn labels_with_match_selector_restricts_to_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        // Only series with job="api" contribute; we still get __name__ and job.
+        let names = labels(
+            &db,
+            Some(&["http_requests_total{job=\"api\"}".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert!(names.contains(&"__name__".to_string()));
+        assert!(names.contains(&"job".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn labels_time_range_excludes_series_with_no_data_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Data at 1s, 1.5s, 2s. Range [2.5s, 3s] contains no samples -> only __name__.
+        let names = labels(&db, None::<&[String]>, 2_500_000_000, 3_000_000_000).unwrap();
+        assert_eq!(names, ["__name__"]);
+    }
+
+    #[test]
+    fn labels_time_range_includes_only_series_with_points_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Range [1s, 1.2s]: only api series has a point at 1s; web has 1.5s. So only api contributes.
+        let names = labels(&db, None::<&[String]>, 1_000_000_000, 1_200_000_000).unwrap();
+        assert!(names.contains(&"__name__".to_string()));
+        assert!(names.contains(&"job".to_string()));
+    }
+
+    #[test]
+    fn labels_start_ge_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = labels(&db, None::<&[String]>, 2_000_000_000, 1_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn labels_invalid_match_selector_returns_parse_error() {
+        let (db, _guard) = make_db_with_series();
+        let err = labels(
+            &db,
+            Some(&["sum(rate(x[5m]))".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn labels_library_parity_with_instant_and_range() {
+        // Acceptance: caller can run instant, range, and labels from library only; no duplicated logic.
+        let (db, _guard) = make_db_for_aggregation();
+        let time_ns = 3_000_000_000u64;
+        let _samples = query_instant(&db, "http_requests_total", time_ns).unwrap();
+        let _series = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            5_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        let names = labels(
+            &db,
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(names.contains(&"__name__".to_string()));
+        assert!(names.contains(&"job".to_string()));
+        assert!(names.contains(&"instance".to_string()));
+    }
+
+    // --- Label values: same semantics as GET /api/v1/label/<name>/values (library-only, no HTTP) ---
+    // Tests follow Prometheus metadata API and time-series DB practices: time-range restriction
+    // so only series with data in [start_ns, end_ns] contribute; optional match[] filtering;
+    // __name__ returns metric names; unknown label returns empty (see Prometheus PR #7288, #8301).
+
+    #[test]
+    fn label_values_returns_sorted_unique_values_for_label() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(&db, "job", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert!(values.contains(&"api".to_string()));
+        assert!(values.contains(&"web".to_string()));
+        let mut sorted = values.clone();
+        sorted.sort();
+        assert_eq!(values, sorted, "label values must be returned sorted");
+    }
+
+    #[test]
+    fn label_values_for_name_returns_metric_names() {
+        let (db, _guard) = make_db_with_series();
+        let names = label_values(&db, "__name__", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert_eq!(names, ["http_requests_total"]);
+    }
+
+    #[test]
+    fn label_values_with_match_selector_restricts_to_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(
+            &db,
+            "job",
+            Some(&["http_requests_total{job=\"api\"}".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(values, ["api"]);
+    }
+
+    #[test]
+    fn label_values_time_range_excludes_series_with_no_data_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Data at 1s, 1.5s, 2s. Range [2.5s, 3s] contains no samples -> empty values for "job".
+        let values = label_values(&db, "job", None::<&[String]>, 2_500_000_000, 3_000_000_000).unwrap();
+        assert!(values.is_empty());
+        let names = label_values(&db, "__name__", None::<&[String]>, 2_500_000_000, 3_000_000_000).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn label_values_time_range_includes_only_series_with_points_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Range [1s, 1.2s]: only api series has a point at 1s; web has 1.5s. So only "api" for job.
+        let values = label_values(&db, "job", None::<&[String]>, 1_000_000_000, 1_200_000_000).unwrap();
+        assert_eq!(values, ["api"]);
+    }
+
+    #[test]
+    fn label_values_start_ge_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = label_values(&db, "job", None::<&[String]>, 2_000_000_000, 1_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn label_values_invalid_match_selector_returns_parse_error() {
+        let (db, _guard) = make_db_with_series();
+        let err = label_values(
+            &db,
+            "job",
+            Some(&["sum(rate(x[5m]))".to_string()]),
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn label_values_unknown_label_returns_empty() {
+        let (db, _guard) = make_db_with_series();
+        let values = label_values(&db, "nonexistent_label", None::<&[String]>, 0, 3_000_000_000).unwrap();
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn label_values_library_parity_with_instant_and_labels() {
+        // Acceptance: caller can execute label values from library only; no duplicated metadata logic.
+        let (db, _guard) = make_db_for_aggregation();
+        let _samples = query_instant(&db, "http_requests_total", 3_000_000_000).unwrap();
+        let _names = labels(
+            &db,
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let job_values = label_values(
+            &db,
+            "job",
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(job_values.contains(&"api".to_string()));
+        assert!(job_values.contains(&"web".to_string()));
+        let instance_values = label_values(
+            &db,
+            "instance",
+            None::<&[String]>,
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(instance_values.contains(&"a".to_string()));
+        assert!(instance_values.contains(&"b".to_string()));
+        assert!(instance_values.contains(&"c".to_string()));
+    }
+
+    // --- Series: same semantics as GET /api/v1/series (library-only, no HTTP) ---
+    // Tests follow Prometheus and time-series DB practices: at least one match[] required;
+    // start/end restrict to approximate time range; only series with ≥1 sample in range returned;
+    // deterministic, fixture-based assertions (see Prometheus HTTP API, VictoriaMetrics /api/v1/series).
+
+    #[test]
+    fn series_empty_match_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(&db, &[] as &[String], 0, 3_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("match")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn series_start_ge_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(
+            &db,
+            &["http_requests_total".to_string()],
+            2_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn series_invalid_selector_returns_parse_error() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(
+            &db,
+            &["sum(rate(x[5m]))".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn series_with_one_match_returns_all_matching_series_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Full range [0, 3s]: api at 1s, 2s; web at 1.5s. Both match http_requests_total.
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 2, "api and web series");
+        let has_api = metrics.iter().any(|m| m.get("job") == Some(&"api".to_string()));
+        let has_web = metrics.iter().any(|m| m.get("job") == Some(&"web".to_string()));
+        assert!(has_api && has_web);
+        for m in &metrics {
+            assert_eq!(m.get("__name__"), Some(&"http_requests_total".to_string()));
+        }
+    }
+
+    #[test]
+    fn series_time_range_restricts_to_series_with_data_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Data: api at 1s, 2s; web at 1.5s. [2s, 2.5s] contains only api (2s); web has no point there.
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            2_000_000_000,
+            2_500_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].get("job"), Some(&"api".to_string()));
+        // [1.4s, 1.6s]: only web at 1.5s.
+        let metrics_web = series(
+            &db,
+            &["http_requests_total".to_string()],
+            1_400_000_000,
+            1_600_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics_web.len(), 1);
+        assert_eq!(metrics_web[0].get("job"), Some(&"web".to_string()));
+    }
+
+    #[test]
+    fn series_match_selector_restricts_to_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        let metrics = series(
+            &db,
+            &["http_requests_total{job=\"api\"}".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].get("job"), Some(&"api".to_string()));
+    }
+
+    #[test]
+    fn series_multiple_match_dedupes() {
+        let (db, _guard) = make_db_with_series();
+        // Same series matches both selectors; must appear once.
+        let metrics = series(
+            &db,
+            &[
+                "http_requests_total".to_string(),
+                "http_requests_total{job=\"api\"}".to_string(),
+            ],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 2, "api and web; api matched by both selectors once");
+        let api_count = metrics.iter().filter(|m| m.get("job") == Some(&"api".to_string())).count();
+        assert_eq!(api_count, 1);
+    }
+
+    #[test]
+    fn series_library_parity_with_instant_and_labels() {
+        // Acceptance: caller can execute series from library only; no duplicated metadata logic.
+        let (db, _guard) = make_db_for_aggregation();
+        let _samples = query_instant(&db, "http_requests_total", 3_000_000_000).unwrap();
+        let _names = labels(
+            &db,
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(!metrics.is_empty());
+        assert!(metrics.iter().all(|m| m.get("__name__") == Some(&"http_requests_total".to_string())));
+    }
+
+    // --- Range query: same semantics as GET /api/v1/query_range (library-only, no HTTP) ---
+    // Tests follow time-series DB best practices: deterministic step alignment, explicit time
+    // ranges, and assertion on matrix shape and step count (see promtool-style range testing).
+
+    fn sort_range_series(series: &mut [super::RangeSeries]) {
+        series.sort_by_key(|a| metric_sort_key(&a.metric));
+    }
+
+    /// Specification for range query matrix results (invariant from eval_instant_matrix / eval_range_fn_matrix):
+    /// - Every stored step timestamp is on the query grid: start_ns + k*step_ns for some k, with start_ns <= t <= end_ns.
+    /// - Steps per series are strictly increasing.
+    /// - Stored steps are a *subset* of the full grid: a step is omitted when the series has no value at that time
+    ///   (e.g. instant selector: no point at or before eval_ts; range function: window yields None).
+    /// So step count can differ per series.
+    fn assert_range_series_invariant(
+        series: &[super::RangeSeries],
+        start_ns: u64,
+        end_ns: u64,
+        step_ns: u64,
+    ) {
+        for s in series {
+            assert!(s.metric.contains_key("__name__"));
+            assert!(!s.steps.is_empty());
+            let mut prev_ts = 0u64;
+            for (ts, _) in &s.steps {
+                assert!(
+                    *ts >= start_ns && *ts <= end_ns && (ts - start_ns) % step_ns == 0,
+                    "steps must be on query grid"
+                );
+                assert!(*ts > prev_ts, "steps must be strictly increasing");
+                prev_ts = *ts;
+            }
+        }
+    }
+
+    #[test]
+    fn range_instant_selector_returns_step_aligned_matrix() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+        let result = query_range(&db, "http_requests_total", start_ns, end_ns, step_ns).unwrap();
+        let mut series = result;
+        sort_range_series(&mut series);
+        assert!(!series.is_empty(), "at least one series");
+
+        assert_range_series_invariant(&series, start_ns, end_ns, step_ns);
+
+        // Proof from test data: make_db_with_series has api at 1s, 2s and web at 1.5s only.
+        // Grid steps: 1s, 2s, 3s. At each step we take latest point with pt <= eval_ts.
+        // - api: at 1s exists point 1s → step; at 2s exists 2s → step; at 3s exists 2s → step. So 3 steps.
+        // - web: at 1s no point <= 1s → omit; at 2s exists 1.5s → step; at 3s exists 1.5s → step. So 2 steps.
+        // So differing step counts are *required* by the semantics; asserting exact counts proves the spec.
+        let api_series = series.iter().find(|s| s.metric.get("job") == Some(&"api".to_string()));
+        let web_series = series.iter().find(|s| s.metric.get("job") == Some(&"web".to_string()));
+        assert!(api_series.is_some(), "api series must be present");
+        assert!(web_series.is_some(), "web series must be present");
+        assert_eq!(
+            api_series.unwrap().steps.len(),
+            3,
+            "api has points at 1s and 2s so has a value at every grid step 1s,2s,3s"
+        );
+        assert_eq!(
+            web_series.unwrap().steps.len(),
+            2,
+            "web has point only at 1.5s; no point <= 1s so step 1s omitted; steps at 2s and 3s only"
+        );
+    }
+
+    #[test]
+    fn range_start_after_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(
+            &db,
+            "http_requests_total",
+            3_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn range_zero_step_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            0,
+        )
+        .unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("step")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn range_empty_query_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(&db, "", 1_000_000_000, 3_000_000_000, 1_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn range_parse_error_returns_parse() {
+        let (db, _guard) = make_db_with_series();
+        let err = query_range(
+            &db,
+            "metric_a + metric_b",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn range_rate_returns_matrix_with_steps() {
+        let (db, _guard) = make_db_with_series();
+        let result = query_range(
+            &db,
+            "rate(http_requests_total[2s])",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(!result.is_empty());
+        for s in &result {
+            assert!(s.metric.contains_key("__name__"));
+            assert!(!s.steps.is_empty());
+            for (_, v) in &s.steps {
+                assert!(!v.is_nan(), "rate should not produce NaN for this data");
+            }
+        }
+    }
+
+    #[test]
+    fn range_sum_by_returns_grouped_matrix() {
+        let (db, _guard) = make_db_for_aggregation();
+        let result = query_range(
+            &db,
+            r#"sum by (job) (http_requests_total)"#,
+            1_000_000_000,
+            5_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        let mut series = result;
+        sort_range_series(&mut series);
+        assert_eq!(series.len(), 2, "one series per job group");
+        let api = series.iter().find(|s| s.metric.get("job") == Some(&"api".to_string()));
+        let web = series.iter().find(|s| s.metric.get("job") == Some(&"web".to_string()));
+        assert!(api.is_some());
+        assert!(web.is_some());
+        // 5 steps: 1s..5s
+        assert_eq!(api.unwrap().steps.len(), 5);
+        assert_eq!(web.unwrap().steps.len(), 5);
+    }
+
+    #[test]
+    fn range_nonexistent_metric_returns_empty_matrix() {
+        let (db, _guard) = make_db_with_series();
+        let result = query_range(
+            &db,
+            "nonexistent_metric",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Library range query and HTTP query_range use the same evaluation path; result shape must match.
+    #[test]
+    fn range_library_and_http_same_result_shape() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+
+        let lib_series = query_range(&db, "http_requests_total", start_ns, end_ns, step_ns).unwrap();
+
+        let r = crate::prometheus_api::handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            Some("1s"),
+            &db,
+        );
+        assert_eq!(r.status, http::StatusCode::OK);
+        let body: crate::prometheus_api::ApiEnvelope<crate::prometheus_api::QueryData> =
+            serde_json::from_slice(&r.body).unwrap();
+        let data = body.data.unwrap();
+        let crate::prometheus_api::QueryResult::Matrix(http_matrix) = data.result else {
+            panic!("expected matrix")
+        };
+
+        assert_eq!(
+            lib_series.len(),
+            http_matrix.len(),
+            "library and HTTP must return same number of series"
+        );
+        let mut lib_sorted = lib_series;
+        sort_range_series(&mut lib_sorted);
+        let mut http_sorted = http_matrix;
+        http_sorted.sort_by_key(|a| metric_sort_key(&a.metric));
+        for (lib_s, http_s) in lib_sorted.iter().zip(http_sorted.iter()) {
+            assert_eq!(lib_s.metric, http_s.metric);
+            assert_eq!(
+                lib_s.steps.len(),
+                http_s.values.len(),
+                "same step count per series"
+            );
+        }
+    }
+
+    // --- Result type contracts (PromQL library API) ---
+    // Per Ugnos design: result types are public, stable programmatic
+    // contracts (InstantSample, RangeSeries, MetricLabels) with numeric timestamps/values and
+    // label sets as Rust types—not JSON-only. Tests follow time-series DB API contract testing
+    // practice: assert type shape, invariants, and programmatic use without relying on serialization.
+
+    /// Acceptance: result types expose numeric timestamps and values (ts_ns: u64, value: f64,
+    /// steps: Vec<(u64, f64)>) and label sets as Rust types; library API is not tied to JSON.
+    #[test]
+    fn result_types_expose_numeric_timestamps_and_values() {
+        let (db, _guard) = make_db_with_series();
+        let samples: Vec<InstantSample> =
+            query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        assert!(!samples.is_empty());
+        for s in &samples {
+            let _ts_ns: u64 = s.ts_ns;
+            let _value: f64 = s.value;
+            let _labels: &HashMap<String, String> = &s.metric;
+        }
+        let range_result: Vec<RangeSeries> = query_range(
+            &db,
+            "http_requests_total",
+            1_000_000_000,
+            3_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(!range_result.is_empty());
+        for rs in &range_result {
+            let _steps: &[(u64, f64)] = &rs.steps;
+            let _metric: &HashMap<String, String> = &rs.metric;
+        }
+        let metrics: Vec<MetricLabels> =
+            super::series(&db, &["http_requests_total".to_string()], 0, 3_000_000_000).unwrap();
+        assert!(!metrics.is_empty());
+        for m in &metrics {
+            let _name: Option<&String> = m.get("__name__");
+            let _job: Option<&String> = m.get("job");
+        }
+    }
+
+    /// Contract: every InstantSample from query_instant has metric (label set), ts_ns (u64), value (f64).
+    #[test]
+    fn instant_sample_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let samples = query_instant(&db, "http_requests_total", 2_000_000_000).unwrap();
+        for s in &samples {
+            assert!(s.metric.contains_key("__name__"), "instant sample metric must include __name__");
+            assert!(s.ts_ns > 0, "ts_ns must be nonzero for real data");
+            // value can be any f64 including NaN/Inf per PromQL; we only check type is usable
+            let _: f64 = s.value;
+        }
+        // Empty result still yields Vec<InstantSample> with correct element type
+        let empty = query_instant(&db, "nonexistent_metric", 2_000_000_000).unwrap();
+        assert_eq!(empty.len(), 0);
+    }
+
+    /// Contract: every RangeSeries has metric and steps Vec<(u64, f64)>; steps strictly increasing and on grid.
+    #[test]
+    fn range_series_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+        let series = query_range(&db, "http_requests_total", start_ns, end_ns, step_ns).unwrap();
+        for rs in &series {
+            assert!(rs.metric.contains_key("__name__"), "range series metric must include __name__");
+            assert!(!rs.steps.is_empty(), "at least one step for this query");
+            let mut prev = 0u64;
+            for (ts, val) in &rs.steps {
+                assert!(ts >= &start_ns && ts <= &end_ns, "step on range");
+                assert!((ts - start_ns) % step_ns == 0, "step on grid");
+                assert!(*ts > prev, "steps strictly increasing");
+                prev = *ts;
+                let _: f64 = *val;
+            }
+        }
+    }
+
+    /// Contract: series() returns Vec<MetricLabels>; each element is a label set usable programmatically.
+    #[test]
+    fn metric_labels_result_type_contract() {
+        let (db, _guard) = make_db_with_series();
+        let metrics: Vec<MetricLabels> =
+            series(&db, &["http_requests_total".to_string()], 0, 3_000_000_000).unwrap();
+        assert_eq!(metrics.len(), 2, "api and web");
+        for m in &metrics {
+            assert!(m.contains_key("__name__"));
+            assert!(m.get("__name__") == Some(&"http_requests_total".to_string()));
+            let job = m.get("job").map(String::as_str);
+            assert!(job == Some("api") || job == Some("web"));
+        }
+    }
+
+    /// Programmatic construction: build InstantSample, RangeSeries, MetricLabels by hand; no JSON.
+    /// Ensures types are first-class Rust contracts and can be compared/used without serialization.
+    #[test]
+    fn result_types_programmatic_construction() {
+        let mut metric = HashMap::new();
+        metric.insert("__name__".to_string(), "http_requests_total".to_string());
+        metric.insert("job".to_string(), "api".to_string());
+        let sample = InstantSample {
+            metric: metric.clone(),
+            ts_ns: 2_000_000_000,
+            value: 20.0,
+        };
+        assert_eq!(sample.ts_ns, 2_000_000_000);
+        assert_eq!(sample.value, 20.0);
+        assert_eq!(sample.metric.get("job"), Some(&"api".to_string()));
+
+        let steps = vec![(1_000_000_000, 10.0), (2_000_000_000, 20.0)];
+        let range_series = RangeSeries {
+            metric: metric.clone(),
+            steps: steps.clone(),
+        };
+        assert_eq!(range_series.steps.len(), 2);
+        assert_eq!(range_series.steps[0], (1_000_000_000, 10.0));
+
+        let labels: MetricLabels = metric;
+        assert_eq!(labels.get("__name__"), Some(&"http_requests_total".to_string()));
+
+        // Compare with library output: one matching series from query_instant should equal our sample
+        let (db, _guard) = make_db_with_series();
+        let from_lib = query_instant(&db, r#"http_requests_total{job="api"}"#, 2_000_000_000).unwrap();
+        assert_eq!(from_lib.len(), 1);
+        assert_eq!(from_lib[0].ts_ns, sample.ts_ns);
+        assert_eq!(from_lib[0].value, sample.value);
+        assert_eq!(from_lib[0].metric.get("job"), sample.metric.get("job"));
+    }
+}

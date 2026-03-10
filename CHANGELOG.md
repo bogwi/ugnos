@@ -10,6 +10,27 @@ Goal: become usable as a production database via a networked server binary and s
 
 ## [Released]
 
+### [0.6.0] - 2026-03-10 - PromQL library API: full surface and readiness
+
+### Added
+*Deliverables:*
+- **PromQL library API**: dedicated public module `ugnos::promql` as the single entry point for running PromQL against a `DbCore` from library code (no HTTP). Same semantics as the Prometheus HTTP API.
+  - **Instant query**: `query_instant(db, query, time_ns)` → `Result<Vec<InstantSample>, PromqlError>` — same as `GET /api/v1/query`.
+  - **Range query**: `query_range(db, query, start_ns, end_ns, step_ns)` → `Result<Vec<RangeSeries>, PromqlError>` — same as `GET /api/v1/query_range`.
+  - **Labels**: `labels(db, match_selectors?, start_ns, end_ns)` → `Result<Vec<String>, PromqlError>` — same as `GET /api/v1/labels`; optional `match[]`; required `start`/`end` restrict to approximate time range.
+  - **Label values**: `label_values(db, label_name, match_selectors?, start_ns, end_ns)` → `Result<Vec<String>, PromqlError>` — same as `GET /api/v1/label/<name>/values`; optional `match[]`; required `start`/`end` restrict to approximate time range.
+  - **Series**: `series(db, match_selectors, start_ns, end_ns)` → `Result<Vec<MetricLabels>, PromqlError>` — same as `GET /api/v1/series`; at least one `match[]` required; required `start`/`end` restrict to approximate time range.
+- **Stable result types**: `InstantSample` (metric labels + `ts_ns` + `value: f64`), `RangeSeries` (metric labels + `steps: Vec<(u64, f64)>`), `MetricLabels` (label set); programmatic contracts, not JSON-only shapes.
+- **Unified `PromqlError`** with distinct variants: **Parse** (invalid PromQL), **BadParameter** (missing/invalid time/step/range), **Execution** (storage/`DbError`) — library callers can react by variant without string matching.
+- **Time/step parsing helpers** in `ugnos::promql`: `parse_eval_time(s: Option<&str>)` (None/empty → "now"), `parse_step(s: &str)` returning step in **nanoseconds**; same behavior as the HTTP API so config/CLI string params can be reused.
+- **HTTP handlers** refactored to: parse query params (including `match[]`, `start`, `end` for labels/label_values/series; time/step helpers for queries) → call library functions → serialize response and map `PromqlError` to HTTP status/body. No second implementation of evaluation or metadata.
+
+*Acceptance criteria:*
+- Library and HTTP layer use the same error taxonomy; unit tests assert `PromqlError::Parse` → 422, `PromqlError::BadParameter` → 400, `PromqlError::Execution` → 500.
+- Handler delegation tests: for each endpoint, same inputs to HTTP handler and `ugnos::promql` function yield identical logical results (sample count, metrics, values).
+
+## [Released]
+
 ### [0.5.0] - 2026-02-25 - Query Language
 
 ### Added

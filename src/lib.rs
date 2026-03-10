@@ -28,6 +28,9 @@ pub mod remote_write;
 /// Prometheus HTTP API v1 (query, query_range, labels, label values, series) for Grafana compatibility.
 pub mod prometheus_api;
 
+/// PromQL library API: run PromQL against a [`DbCore`] from library code (no HTTP).
+pub mod promql;
+
 /// Generated Prometheus prompb types (WriteRequest, TimeSeries, Sample, Label).
 pub mod prometheus {
     #![allow(clippy::all)]
@@ -54,6 +57,10 @@ pub use crate::types::TagSet;
 pub use crate::types::Timestamp;
 /// Type alias for a value in a time series (f64).
 pub use crate::types::Value;
+
+// PromQL library API: stable result types and error (programmatic contracts, not JSON-only).
+pub use crate::promql::{MetricLabels, PromqlError};
+pub use crate::promql::{InstantSample, RangeSeries};
 
 // Default flush interval if not specified
 use std::time::Duration;

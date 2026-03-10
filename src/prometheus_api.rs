@@ -9,6 +9,7 @@
 //! with `by`/`without` grouping — sufficient for a representative Grafana
 //! dashboard subset.
 
+use crate::promql::{self, PromqlError};
 use crate::DbCore;
 use crate::error::DbError;
 use crate::query::{
@@ -16,15 +17,13 @@ use crate::query::{
     compute_rate, compute_sum_over_time,
 };
 use crate::query_surface::{
-    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, parse_eval_expr, parse_instant_selector,
-    series_matches_selector,
+    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, series_matches_selector,
 };
 use http::StatusCode;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Content-Type for Prometheus API JSON responses.
 pub const PROMETHEUS_API_CONTENT_TYPE: &str = "application/json";
@@ -112,77 +111,6 @@ fn ns_to_sec(ns: u64) -> f64 {
     (ns as f64) / 1e9
 }
 
-/// Current time in nanoseconds since epoch.
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-/// Parse optional `time` query param: Unix seconds (float or int) or RFC3339.
-fn parse_time_param(s: Option<&str>) -> Result<u64, String> {
-    let s = match s {
-        Some(t) => t.trim(),
-        None => return Ok(now_ns()),
-    };
-    if s.is_empty() {
-        return Ok(now_ns());
-    }
-    if let Ok(secs) = s.parse::<f64>() {
-        if secs.is_finite() && secs >= 0.0 {
-            return Ok((secs * 1e9) as u64);
-        }
-    }
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(secs * 1_000_000_000);
-    }
-    Err(format!(
-        "invalid time parameter (use Unix seconds): {:?}",
-        s
-    ))
-}
-
-/// Parse duration in seconds from step param (e.g. "15s" -> 15, "1m" -> 60).
-fn parse_step_seconds(s: Option<&str>) -> Result<u64, String> {
-    let s = match s {
-        Some(t) => t.trim(),
-        None => return Err("missing step parameter".to_string()),
-    };
-    if s.is_empty() {
-        return Err("empty step parameter".to_string());
-    }
-    let s = ascii_lower(s);
-    let (num_str, mult) = if s.ends_with("s") {
-        (&s[..s.len() - 1], 1u64)
-    } else if s.ends_with("m") {
-        (&s[..s.len() - 1], 60)
-    } else if s.ends_with("h") {
-        (&s[..s.len() - 1], 3600)
-    } else if s.ends_with("d") {
-        (&s[..s.len() - 1], 86400)
-    } else if let Ok(n) = s.parse::<f64>() {
-        return Ok(if n >= 0.0 && n.is_finite() {
-            n as u64
-        } else {
-            1
-        });
-    } else {
-        return Err(format!("invalid step: {:?}", s));
-    };
-    let n: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid step number: {:?}", num_str))?;
-    if !n.is_finite() || n < 0.0 {
-        return Err("step must be non-negative".to_string());
-    }
-    Ok((n * mult as f64) as u64)
-}
-
-fn ascii_lower(s: &str) -> String {
-    s.chars().map(|c| c.to_ascii_lowercase()).collect()
-}
-
 /// Build Prometheus metric map from series name and tag set (including __name__).
 fn metric_from_series_and_tags(
     series: &str,
@@ -228,25 +156,28 @@ impl PrometheusApiResponse {
     }
 }
 
-// ---------- Internal evaluation types ----------
+// ---------- Internal evaluation types (pub(crate) for promql module) ----------
 
 /// Intermediate per-series data during evaluation (before JSON formatting).
-struct EvalSample {
-    metric: HashMap<String, String>,
-    ts_ns: u64,
-    value: f64,
+#[allow(missing_docs)]
+pub(crate) struct EvalSample {
+    pub metric: HashMap<String, String>,
+    pub ts_ns: u64,
+    pub value: f64,
 }
 
 /// Per-series data for range (matrix) evaluation: step-aligned `(ts_ns, value)` pairs.
-struct EvalSeriesData {
-    metric: HashMap<String, String>,
-    steps: Vec<(u64, f64)>,
+/// Used by the public [`crate::promql::query_range`] API and by HTTP serialization.
+pub(crate) struct EvalSeriesData {
+    pub metric: HashMap<String, String>,
+    pub steps: Vec<(u64, f64)>,
 }
 
 // ---------- Instant query evaluation ----------
 
 /// Evaluate an expression at a single instant, returning a vector of samples.
-fn eval_vector(
+/// Used by the public [`crate::promql::query_instant`] API.
+pub(crate) fn eval_vector(
     expr: &EvalExpr,
     time_ns: u64,
     db: &Arc<DbCore>,
@@ -474,7 +405,8 @@ fn group_metric(metric: &HashMap<String, String>, grouping: &Grouping) -> HashMa
 // ---------- Range (matrix) query evaluation ----------
 
 /// Evaluate an expression over a time range, producing step-aligned matrix data.
-fn eval_matrix(
+/// Used by the public [`crate::promql::query_range`] API; HTTP handler delegates to that.
+pub(crate) fn eval_matrix(
     expr: &EvalExpr,
     start_ns: u64,
     end_ns: u64,
@@ -502,6 +434,14 @@ fn eval_matrix(
 }
 
 /// Evaluate an instant selector over a range: at each step, find the latest sample.
+///
+/// **Step semantics (proof that stored steps are a subset of the full grid):**
+/// The loop iterates over the full grid `t = start_ns, start_ns+step_ns, ... <= end_ns`.
+/// A step `(t, val)` is pushed only when there exists a point with `pt <= eval_ts` (see
+/// `if let Some(...)` below). If at a grid time there is no such point (e.g. first sample
+/// is after that time), that step is omitted. Hence the stored steps are exactly those
+/// grid times where the series has a defined value — a *subset* of the full grid, not
+/// necessarily the same count across series.
 fn eval_instant_matrix(
     selector: &InstantSelector,
     start_ns: u64,
@@ -561,6 +501,10 @@ fn eval_instant_matrix(
 
 /// Evaluate a range function over a time range: pre-fetch the full data window,
 /// then compute the function at each step.
+///
+/// **Step semantics:** Same as instant matrix: we iterate the full grid but push only
+/// when `apply_range_fn` returns `Ok(Some(val))`; otherwise that step is omitted.
+/// So stored steps are a subset of the full grid.
 fn eval_range_fn_matrix(
     func: RangeFn,
     selector: &InstantSelector,
@@ -671,6 +615,8 @@ fn aggregate_matrix(
 // ---------- Public API handlers ----------
 
 /// GET /api/v1/query?query=...&time=...
+///
+/// Delegates to [`crate::promql::query_instant`]; parses time param then serializes the result.
 pub fn handle_query(
     query_param: Option<&str>,
     time_param: Option<&str>,
@@ -686,26 +632,26 @@ pub fn handle_query(
             );
         }
     };
-    let expr = match parse_eval_expr(query) {
-        Ok(e) => e,
-        Err(e) => {
-            return PrometheusApiResponse::err_json(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "bad_data",
-                e,
-            );
-        }
-    };
-    let time_ns = match parse_time_param(time_param) {
+    let time_ns = match promql::parse_eval_time(time_param) {
         Ok(t) => t,
         Err(e) => {
             return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
         }
     };
 
-    let samples = match eval_vector(&expr, time_ns, db) {
+    let samples = match crate::promql::query_instant(db, query, time_ns) {
         Ok(s) => s,
-        Err(e) => {
+        Err(crate::promql::PromqlError::Parse(e)) => {
+            return PrometheusApiResponse::err_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bad_data",
+                e,
+            );
+        }
+        Err(crate::promql::PromqlError::BadParameter(e)) => {
+            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+        }
+        Err(crate::promql::PromqlError::Execution(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -729,6 +675,8 @@ pub fn handle_query(
 }
 
 /// GET /api/v1/query_range?query=...&start=...&end=...&step=...
+///
+/// Delegates to [`promql::query_range`]; no duplicated evaluation logic.
 pub fn handle_query_range(
     query_param: Option<&str>,
     start_param: Option<&str>,
@@ -747,7 +695,7 @@ pub fn handle_query_range(
         }
     };
     let start_ns = match start_param {
-        Some(s) => match parse_time_param(Some(s)) {
+        Some(s) => match promql::parse_eval_time(Some(s)) {
             Ok(t) => t,
             Err(e) => {
                 return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
@@ -762,7 +710,7 @@ pub fn handle_query_range(
         }
     };
     let end_ns = match end_param {
-        Some(s) => match parse_time_param(Some(s)) {
+        Some(s) => match promql::parse_eval_time(Some(s)) {
             Ok(t) => t,
             Err(e) => {
                 return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
@@ -776,35 +724,35 @@ pub fn handle_query_range(
             );
         }
     };
-    if start_ns >= end_ns {
-        return PrometheusApiResponse::err_json(
-            StatusCode::BAD_REQUEST,
-            "bad_data",
-            "start must be before end".to_string(),
-        );
-    }
-    let step_secs = match parse_step_seconds(step_param) {
-        Ok(s) => s,
-        Err(e) => {
-            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+    let step_ns = match step_param {
+        Some(s) => match promql::parse_step(s) {
+            Ok(ns) => ns,
+            Err(e) => {
+                return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+            }
+        },
+        None => {
+            return PrometheusApiResponse::err_json(
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                "missing step parameter".to_string(),
+            );
         }
     };
-    let step_ns = step_secs * 1_000_000_000;
 
-    let expr = match parse_eval_expr(query) {
-        Ok(e) => e,
-        Err(e) => {
+    let series = match promql::query_range(db, query, start_ns, end_ns, step_ns) {
+        Ok(s) => s,
+        Err(PromqlError::Parse(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "bad_data",
                 e,
             );
         }
-    };
-
-    let eval_data = match eval_matrix(&expr, start_ns, end_ns, step_ns, db) {
-        Ok(d) => d,
-        Err(e) => {
+        Err(PromqlError::BadParameter(e)) => {
+            return PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e);
+        }
+        Err(PromqlError::Execution(e)) => {
             return PrometheusApiResponse::err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -813,11 +761,11 @@ pub fn handle_query_range(
         }
     };
 
-    let matrix: Vec<MatrixSeries> = eval_data
+    let matrix: Vec<MatrixSeries> = series
         .into_iter()
-        .map(|sd| MatrixSeries {
-            metric: sd.metric,
-            values: sd
+        .map(|rs| MatrixSeries {
+            metric: rs.metric,
+            values: rs
                 .steps
                 .into_iter()
                 .map(|(ts, val)| json_sample_pair(ts, val))
@@ -831,73 +779,119 @@ pub fn handle_query_range(
     })
 }
 
-/// GET /api/v1/labels
-pub fn handle_labels(db: &Arc<DbCore>) -> PrometheusApiResponse {
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    names.insert("__name__".to_string());
-    for (_, tags) in db.list_series_keys() {
-        for k in tags.keys() {
-            names.insert(k.clone());
+/// GET /api/v1/labels?match[]=...&start=...&end=...
+///
+/// Delegates to [`promql::labels`]; no duplicated metadata logic.
+/// Optional `start`/`end` (Unix seconds or RFC3339): if both provided, restrict to that time range;
+/// if either missing, use 0 to now for backward compatibility.
+pub fn handle_labels(
+    match_params: &[String],
+    start_param: Option<&str>,
+    end_param: Option<&str>,
+    db: &Arc<DbCore>,
+) -> PrometheusApiResponse {
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => promql::parse_eval_time(None).unwrap(),
+    };
+    let match_selectors: Option<&[String]> = if match_params.is_empty() {
+        None
+    } else {
+        Some(match_params)
+    };
+    match promql::labels(db, match_selectors, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
+        }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    let mut data: Vec<String> = names.into_iter().collect();
-    data.sort();
-    PrometheusApiResponse::ok_json(data)
 }
 
 /// GET /api/v1/label/<name>/values
-pub fn handle_label_values(label_name: &str, db: &Arc<DbCore>) -> PrometheusApiResponse {
-    let mut values: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if label_name == "__name__" {
-        for name in db.list_series_names() {
-            values.insert(name);
-        }
+///
+/// Optional `match[]`, `start`, `end`: same semantics as `handle_labels`; if start/end omitted,
+/// uses 0 to now for backward compatibility.
+pub fn handle_label_values(
+    label_name: &str,
+    match_params: &[String],
+    start_param: Option<&str>,
+    end_param: Option<&str>,
+    db: &Arc<DbCore>,
+) -> PrometheusApiResponse {
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => promql::parse_eval_time(None).unwrap(),
+    };
+    let match_selectors: Option<&[String]> = if match_params.is_empty() {
+        None
     } else {
-        for (_, tags) in db.list_series_keys() {
-            if let Some(v) = tags.get(label_name) {
-                values.insert(v.clone());
-            }
+        Some(match_params)
+    };
+    match promql::label_values(db, label_name, match_selectors, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
+        }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    let mut data: Vec<String> = values.into_iter().collect();
-    data.sort();
-    PrometheusApiResponse::ok_json(data)
 }
 
 /// GET /api/v1/series?match[]=...&start=...&end=...
+///
+/// Delegates to [`promql::series`]; no duplicated metadata logic.
+/// Required `match[]` (at least one); optional `start`/`end` (Unix seconds or RFC3339): if both
+/// provided, restrict to that time range; if either missing, use 0 to now for backward compatibility.
 pub fn handle_series(
     match_params: &[String],
-    _start_param: Option<&str>,
-    _end_param: Option<&str>,
+    start_param: Option<&str>,
+    end_param: Option<&str>,
     db: &Arc<DbCore>,
 ) -> PrometheusApiResponse {
-    if match_params.is_empty() {
-        return PrometheusApiResponse::err_json(
-            StatusCode::BAD_REQUEST,
-            "bad_data",
-            "at least one match[] parameter is required".to_string(),
-        );
-    }
-    let mut series_list: Vec<HashMap<String, String>> = Vec::new();
-    for m in match_params {
-        let m = m.trim();
-        if m.is_empty() {
-            continue;
+    let start_ns = match start_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| promql::parse_eval_time(Some(s)).ok()) {
+        Some(t) => t,
+        None => promql::parse_eval_time(None).unwrap(),
+    };
+    match promql::series(db, match_params, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
-        let instant = match parse_instant_selector(m) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for (series_name, tags) in db.list_series_keys() {
-            if series_matches_selector(&series_name, &tags, &instant.selector) {
-                let labels = metric_from_series_and_tags(&series_name, &tags);
-                if !series_list.iter().any(|l| l == &labels) {
-                    series_list.push(labels);
-                }
-            }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
         }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    PrometheusApiResponse::ok_json(series_list)
 }
 
 #[cfg(test)]
@@ -1070,7 +1064,7 @@ mod tests {
     #[test]
     fn labels_returns_name_and_known_labels() {
         let (db, _guard) = make_db_with_series();
-        let r = handle_labels(&db);
+        let r = handle_labels(&[], None, None, &db);
         assert_eq!(r.status, StatusCode::OK);
         let s = String::from_utf8(r.body).unwrap();
         let body: ApiEnvelope<Vec<String>> = serde_json::from_str(&s).unwrap();
@@ -1083,7 +1077,7 @@ mod tests {
     #[test]
     fn label_values_name_returns_metric_names() {
         let (db, _guard) = make_db_with_series();
-        let r = handle_label_values("__name__", &db);
+        let r = handle_label_values("__name__", &[], None, None, &db);
         assert_eq!(r.status, StatusCode::OK);
         let s = String::from_utf8(r.body).unwrap();
         let body: ApiEnvelope<Vec<String>> = serde_json::from_str(&s).unwrap();
@@ -1119,6 +1113,25 @@ mod tests {
     }
 
     #[test]
+    fn series_with_start_end_restricts_to_time_range() {
+        // Same fixture: api at 1s, 2s; web at 1.5s. start=2, end=2.5 -> only api has data in range.
+        let (db, _guard) = make_db_with_series();
+        let r = handle_series(
+            &["http_requests_total".to_string()],
+            Some("2"),
+            Some("2.5"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let s = String::from_utf8(r.body).unwrap();
+        let body: ApiEnvelope<Vec<HashMap<String, String>>> = serde_json::from_str(&s).unwrap();
+        assert_eq!(body.status.as_str(), "success");
+        let data = body.data.unwrap();
+        assert_eq!(data.len(), 1, "only api has a point in [2s, 2.5s]");
+        assert_eq!(data[0].get("job"), Some(&"api".to_string()));
+    }
+
+    #[test]
     fn query_range_valid_returns_matrix() {
         let (db, _guard) = make_db_with_series();
         let r = handle_query_range(
@@ -1142,7 +1155,7 @@ mod tests {
 
     #[test]
     fn query_surface_rejects_aggregation() {
-        let e = parse_instant_selector("sum(rate(x[5m]))").unwrap_err();
+        let e = crate::query_surface::parse_instant_selector("sum(rate(x[5m]))").unwrap_err();
         assert!(
             e.contains("aggregation") || e.contains("function") || e.contains("not yet supported")
         );
@@ -1572,5 +1585,272 @@ mod tests {
             panic!("expected vector")
         };
         assert!(samples.is_empty(), "sum of empty set should be empty");
+    }
+
+    // ---------- HTTP handler delegation and PromqlError → status mapping (4.1 acceptance) ----------
+
+    /// Parse errors (invalid/unsupported PromQL) must map to 422 and envelope errorType "bad_data".
+    #[test]
+    fn handler_parse_error_maps_to_422() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("metric_a + metric_b"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "error");
+        assert_eq!(body.error_type.as_deref(), Some("bad_data"));
+        assert!(body.error.is_some());
+    }
+
+    /// Bad parameter (invalid time/step/range) must map to 400.
+    #[test]
+    fn handler_bad_parameter_maps_to_400() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("http_requests_total"), Some("not-a-number"), &db);
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let body: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "error");
+        assert_eq!(body.error_type.as_deref(), Some("bad_data"));
+    }
+
+    /// Range query: missing step → 400.
+    #[test]
+    fn handler_query_range_missing_step_returns_400() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            None,
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Success response contract: status "success", data present, resultType and result shape.
+    #[test]
+    fn handler_success_envelope_contract() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query(Some("http_requests_total"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let data = body.data.expect("success response must have data");
+        assert_eq!(data.result_type, "vector");
+        let QueryResult::Vector(samples) = data.result else {
+            panic!("expected vector")
+        };
+        for s in &samples {
+            assert_eq!(s.value.len(), 2, "vector sample must be [timestamp, value]");
+            assert!(s.value[0].is_number(), "timestamp must be number");
+            assert!(s.value[1].is_string(), "value must be string (Prometheus format)");
+        }
+    }
+
+    /// Matrix response contract: resultType "matrix", each series has values [[ts, "val"], ...].
+    #[test]
+    fn handler_matrix_envelope_contract() {
+        let (db, _guard) = make_db_with_series();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            Some("1s"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let data = body.data.expect("success response must have data");
+        assert_eq!(data.result_type, "matrix");
+        let QueryResult::Matrix(series) = data.result else {
+            panic!("expected matrix")
+        };
+        for s in &series {
+            for pair in &s.values {
+                assert_eq!(pair.len(), 2);
+                assert!(pair[0].is_number());
+                assert!(pair[1].is_string());
+            }
+        }
+    }
+
+    /// Handler delegation: instant query HTTP response matches library `query_instant` result (same samples, same values).
+    #[test]
+    fn handler_instant_query_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let time_ns = 2_000_000_000;
+        let lib_result = crate::promql::query_instant(&db, "http_requests_total", time_ns).unwrap();
+        let r = handle_query(Some("http_requests_total"), Some("2"), &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        let QueryResult::Vector(mut samples) = body.data.unwrap().result else {
+            panic!("expected vector")
+        };
+        sort_vector_samples(&mut samples);
+        assert_eq!(
+            samples.len(),
+            lib_result.len(),
+            "handler must return same number of samples as library"
+        );
+        let mut lib_sorted: Vec<_> = lib_result.iter().collect();
+        lib_sorted.sort_by_key(|s| metric_sort_key(&s.metric));
+        for (http_s, lib_s) in samples.iter().zip(lib_sorted) {
+            assert_eq!(http_s.metric, lib_s.metric);
+            let http_val: f64 = http_s.value[1].as_str().unwrap().parse().unwrap();
+            assert!(
+                (http_val - lib_s.value).abs() < 1e-9,
+                "value mismatch: HTTP {} vs library {}",
+                http_val,
+                lib_s.value
+            );
+        }
+    }
+
+    /// Handler delegation: range query HTTP response matches library `query_range` result.
+    #[test]
+    fn handler_range_query_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let step_ns = 1_000_000_000;
+        let lib_result = crate::promql::query_range(
+            &db,
+            "http_requests_total",
+            start_ns,
+            end_ns,
+            step_ns,
+        )
+        .unwrap();
+        let r = handle_query_range(
+            Some("http_requests_total"),
+            Some("1"),
+            Some("3"),
+            Some("1s"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<QueryData> = serde_json::from_slice(&r.body).unwrap();
+        let QueryResult::Matrix(mut series) = body.data.unwrap().result else {
+            panic!("expected matrix")
+        };
+        sort_matrix_series(&mut series);
+        assert_eq!(
+            series.len(),
+            lib_result.len(),
+            "handler must return same number of series as library"
+        );
+        let mut lib_sorted: Vec<_> = lib_result.iter().collect();
+        lib_sorted.sort_by_key(|s| metric_sort_key(&s.metric));
+        for (http_s, lib_s) in series.iter().zip(lib_sorted) {
+            assert_eq!(http_s.metric, lib_s.metric);
+            assert_eq!(http_s.values.len(), lib_s.steps.len());
+            for (hp, lp) in http_s.values.iter().zip(lib_s.steps.iter()) {
+                let ts_sec = hp[0].as_f64().unwrap();
+                assert!(
+                    (ts_sec * 1e9 - lp.0 as f64).abs() < 1.0,
+                    "timestamp mismatch"
+                );
+                let http_val: f64 = hp[1].as_str().unwrap().parse().unwrap();
+                assert!(
+                    (http_val - lp.1).abs() < 1e-9,
+                    "value mismatch at step"
+                );
+            }
+        }
+    }
+
+    /// Handler delegation: labels HTTP response matches library `labels` (same set of names).
+    #[test]
+    fn handler_labels_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result = crate::promql::labels(&db, None as Option<&[&str]>, start_ns, end_ns).unwrap();
+        let r = handle_labels(&[], None, None, &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler labels must match library");
+    }
+
+    /// Handler delegation: label values HTTP response matches library `label_values` (same set of values).
+    #[test]
+    fn handler_label_values_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result = crate::promql::label_values(&db, "job", None::<&[&str]>, start_ns, end_ns).unwrap();
+        let r = handle_label_values("job", &[], None, None, &db);
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler label_values must match library");
+    }
+
+    /// Contract test: label_values with match[] and start/end — HTTP and library same inputs → identical results.
+    #[test]
+    fn handler_label_values_with_match_and_time_range_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let match_selectors = ["http_requests_total{job=\"api\"}".to_string()];
+        let start_ns = 1_000_000_000;
+        let end_ns = 3_000_000_000;
+        let lib_result = crate::promql::label_values(
+            &db,
+            "job",
+            Some(match_selectors.as_slice()),
+            start_ns,
+            end_ns,
+        )
+        .unwrap();
+        let r = handle_label_values(
+            "job",
+            &match_selectors,
+            Some("1"),
+            Some("3"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<String>> = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body.status, "success");
+        let http_data = body.data.unwrap();
+        let mut lib_sorted = lib_result.clone();
+        lib_sorted.sort();
+        let mut http_sorted = http_data.clone();
+        http_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler label_values with match and start/end must match library");
+    }
+
+    /// Handler delegation: series HTTP response matches library `series` (same label sets).
+    #[test]
+    fn handler_series_matches_library() {
+        let (db, _guard) = make_db_with_series();
+        let match_selectors = ["http_requests_total"];
+        let start_ns = 0;
+        let end_ns = crate::promql::parse_eval_time(None).unwrap();
+        let lib_result =
+            crate::promql::series(&db, &match_selectors, start_ns, end_ns).unwrap();
+        let r = handle_series(
+            &match_selectors.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
+            None,
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let body: ApiEnvelope<Vec<HashMap<String, String>>> = serde_json::from_slice(&r.body).unwrap();
+        let http_data = body.data.unwrap();
+        assert_eq!(http_data.len(), lib_result.len());
+        let mut http_sorted: Vec<_> = http_data.iter().map(metric_sort_key).collect();
+        http_sorted.sort();
+        let mut lib_sorted: Vec<_> = lib_result.iter().map(metric_sort_key).collect();
+        lib_sorted.sort();
+        assert_eq!(http_sorted, lib_sorted, "handler series must match library");
     }
 }
