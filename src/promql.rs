@@ -1,8 +1,8 @@
 //! PromQL library API: single entry point for running PromQL against a [`DbCore`].
 //!
-//! Exposes instant query, range query, labels, and label values with the same semantics as the
-//! Prometheus HTTP API (`GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`,
-//! `GET /api/v1/label/<name>/values`, etc.), using typed programmatic contracts and a unified error type.
+//! Exposes instant query, range query, labels, label values, and series with the same semantics as
+//! the Prometheus HTTP API (`GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`,
+//! `GET /api/v1/label/<name>/values`, `GET /api/v1/series`), using typed programmatic contracts and a unified error type.
 
 use crate::core::DbCore;
 use crate::error::DbError;
@@ -83,6 +83,12 @@ pub struct RangeSeries {
     /// Step-aligned samples: `(ts_ns, value)` in ascending time order (subset of query grid).
     pub steps: Vec<(u64, f64)>,
 }
+
+/// Label set for a single series (metric name and labels).
+///
+/// Same shape as one element of the `data` array in `GET /api/v1/series`: a map from label name
+/// to value, including `__name__` for the metric name.
+pub type MetricLabels = HashMap<String, String>;
 
 /// Runs an instant query at a single evaluation time.
 ///
@@ -384,6 +390,119 @@ pub fn label_values(
     let mut data: Vec<String> = values.into_iter().collect();
     data.sort();
     Ok(data)
+}
+
+/// Returns the set of series (label sets) that match the given selectors and have at least one
+/// sample in the time range `[start_ns, end_ns]` (inclusive).
+///
+/// Same semantics as `GET /api/v1/series`: at least one `match[]` selector is required;
+/// required `start`/`end` restrict to an approximate time range (only series with data in that
+/// range are returned). Each returned element is the full label set (including `__name__`) for
+/// one series.
+///
+/// # Arguments
+/// * `db` - Database handle (shared).
+/// * `match_selectors` - Non-empty list of PromQL instant selectors (e.g. `http_requests_total`, `metric{job="api"}`).
+///   At least one selector is required; a series is included if it matches any of the selectors.
+/// * `start_ns` - Start of the time range (inclusive), nanoseconds since Unix epoch.
+/// * `end_ns` - End of the time range (inclusive), nanoseconds since Unix epoch.
+///
+/// # Returns
+/// * `Ok(vec)` - List of unique label sets (one per matching series with data in range); may be empty.
+/// * `Err(PromqlError::BadParameter(_))` - Empty `match_selectors` or `start_ns >= end_ns`.
+/// * `Err(PromqlError::Parse(_))` - A selector in `match_selectors` is invalid PromQL.
+/// * `Err(PromqlError::Execution(_))` - Storage error while querying series in range.
+///
+/// # Example
+///
+/// ```ignore
+/// use ugnos::promql::series;
+/// use std::sync::Arc;
+///
+/// let db: Arc<DbCore> = /* ... */;
+/// let start_ns = 1_000_000_000;
+/// let end_ns = 3_000_000_000;
+/// let metrics = series(
+///     &db,
+///     &["http_requests_total".into()],
+///     start_ns,
+///     end_ns,
+/// )?;
+/// ```
+pub fn series(
+    db: &Arc<DbCore>,
+    match_selectors: &[impl AsRef<str>],
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<MetricLabels>, PromqlError> {
+    let selectors_ref: Vec<&str> = match_selectors.iter().map(AsRef::as_ref).collect();
+    let non_empty: Vec<&str> = selectors_ref.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if non_empty.is_empty() {
+        return Err(PromqlError::BadParameter(
+            "at least one match[] parameter is required".to_string(),
+        ));
+    }
+    if start_ns >= end_ns {
+        return Err(PromqlError::BadParameter(
+            "start must be before end".to_string(),
+        ));
+    }
+    let query_end = end_ns.saturating_add(1);
+
+    let keys = db.list_series_keys();
+
+    let parsed: Vec<_> = non_empty
+        .iter()
+        .map(|s| parse_instant_selector(s).map_err(PromqlError::Parse))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let keys_to_consider: Vec<(String, HashMap<String, String>)> = keys
+        .into_iter()
+        .filter(|(name, tags)| {
+            parsed.iter().any(|inst| series_matches_selector(name, tags, &inst.selector))
+        })
+        .collect();
+
+    let mut seen: HashSet<Vec<(String, String)>> = HashSet::new();
+    let mut out: Vec<MetricLabels> = Vec::new();
+    for (series_name, tags) in keys_to_consider {
+        let range = start_ns..query_end;
+        match db.query(&series_name, range, Some(&tags)) {
+            Ok(points) if !points.is_empty() => {
+                let metric = metric_from_series_and_tags(&series_name, &tags);
+                let key: Vec<(String, String)> = {
+                    let mut k: Vec<_> = metric.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+                    k.sort_by(|a, b| a.0.cmp(&b.0));
+                    k
+                };
+                if seen.insert(key) {
+                    out.push(metric);
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    out.sort_by(|a, b| {
+        let mut ka: Vec<_> = a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut kb: Vec<_> = b.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        ka.sort_by(|x, y| x.0.cmp(y.0));
+        kb.sort_by(|x, y| x.0.cmp(y.0));
+        ka.cmp(&kb)
+    });
+    Ok(out)
+}
+
+/// Build metric label set from series name and tag set (including `__name__`).
+fn metric_from_series_and_tags(
+    series: &str,
+    tags: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("__name__".to_string(), series.to_string());
+    for (k, v) in tags {
+        m.insert(k.clone(), v.clone());
+    }
+    m
 }
 
 #[cfg(test)]
@@ -929,6 +1048,151 @@ mod tests {
         assert!(instance_values.contains(&"a".to_string()));
         assert!(instance_values.contains(&"b".to_string()));
         assert!(instance_values.contains(&"c".to_string()));
+    }
+
+    // --- Series: same semantics as GET /api/v1/series (library-only, no HTTP) ---
+    // Tests follow Prometheus and time-series DB practices: at least one match[] required;
+    // start/end restrict to approximate time range; only series with ≥1 sample in range returned;
+    // deterministic, fixture-based assertions (see Prometheus HTTP API, VictoriaMetrics /api/v1/series).
+
+    #[test]
+    fn series_empty_match_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(&db, &[] as &[String], 0, 3_000_000_000).unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("match")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn series_start_ge_end_returns_bad_parameter() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(
+            &db,
+            &["http_requests_total".to_string()],
+            2_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap_err();
+        match &err {
+            PromqlError::BadParameter(msg) => assert!(msg.contains("start") && msg.contains("end")),
+            _ => panic!("expected BadParameter, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn series_invalid_selector_returns_parse_error() {
+        let (db, _guard) = make_db_with_series();
+        let err = series(
+            &db,
+            &["sum(rate(x[5m]))".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn series_with_one_match_returns_all_matching_series_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Full range [0, 3s]: api at 1s, 2s; web at 1.5s. Both match http_requests_total.
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 2, "api and web series");
+        let has_api = metrics.iter().any(|m| m.get("job") == Some(&"api".to_string()));
+        let has_web = metrics.iter().any(|m| m.get("job") == Some(&"web".to_string()));
+        assert!(has_api && has_web);
+        for m in &metrics {
+            assert_eq!(m.get("__name__"), Some(&"http_requests_total".to_string()));
+        }
+    }
+
+    #[test]
+    fn series_time_range_restricts_to_series_with_data_in_range() {
+        let (db, _guard) = make_db_with_series();
+        // Data: api at 1s, 2s; web at 1.5s. [2s, 2.5s] contains only api (2s); web has no point there.
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            2_000_000_000,
+            2_500_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].get("job"), Some(&"api".to_string()));
+        // [1.4s, 1.6s]: only web at 1.5s.
+        let metrics_web = series(
+            &db,
+            &["http_requests_total".to_string()],
+            1_400_000_000,
+            1_600_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics_web.len(), 1);
+        assert_eq!(metrics_web[0].get("job"), Some(&"web".to_string()));
+    }
+
+    #[test]
+    fn series_match_selector_restricts_to_matching_series() {
+        let (db, _guard) = make_db_with_series();
+        let metrics = series(
+            &db,
+            &["http_requests_total{job=\"api\"}".to_string()],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].get("job"), Some(&"api".to_string()));
+    }
+
+    #[test]
+    fn series_multiple_match_dedupes() {
+        let (db, _guard) = make_db_with_series();
+        // Same series matches both selectors; must appear once.
+        let metrics = series(
+            &db,
+            &[
+                "http_requests_total".to_string(),
+                "http_requests_total{job=\"api\"}".to_string(),
+            ],
+            0,
+            3_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(metrics.len(), 2, "api and web; api matched by both selectors once");
+        let api_count = metrics.iter().filter(|m| m.get("job") == Some(&"api".to_string())).count();
+        assert_eq!(api_count, 1);
+    }
+
+    #[test]
+    fn series_library_parity_with_instant_and_labels() {
+        // Acceptance: caller can execute series from library only; no duplicated metadata logic.
+        let (db, _guard) = make_db_for_aggregation();
+        let _samples = query_instant(&db, "http_requests_total", 3_000_000_000).unwrap();
+        let _names = labels(
+            &db,
+            Some(&["http_requests_total".to_string()]),
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let metrics = series(
+            &db,
+            &["http_requests_total".to_string()],
+            1_000_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        assert!(!metrics.is_empty());
+        assert!(metrics.iter().all(|m| m.get("__name__") == Some(&"http_requests_total".to_string())));
     }
 
     // --- Range query: same semantics as GET /api/v1/query_range (library-only, no HTTP) ---

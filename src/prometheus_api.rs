@@ -17,8 +17,7 @@ use crate::query::{
     compute_rate, compute_sum_over_time,
 };
 use crate::query_surface::{
-    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, parse_instant_selector,
-    series_matches_selector,
+    AggOp, EvalExpr, Grouping, InstantSelector, RangeFn, series_matches_selector,
 };
 use http::StatusCode;
 use rayon::prelude::*;
@@ -925,39 +924,38 @@ pub fn handle_label_values(
 }
 
 /// GET /api/v1/series?match[]=...&start=...&end=...
+///
+/// Delegates to [`promql::series`]; no duplicated metadata logic.
+/// Required `match[]` (at least one); optional `start`/`end` (Unix seconds or RFC3339): if both
+/// provided, restrict to that time range; if either missing, use 0 to now for backward compatibility.
 pub fn handle_series(
     match_params: &[String],
-    _start_param: Option<&str>,
-    _end_param: Option<&str>,
+    start_param: Option<&str>,
+    end_param: Option<&str>,
     db: &Arc<DbCore>,
 ) -> PrometheusApiResponse {
-    if match_params.is_empty() {
-        return PrometheusApiResponse::err_json(
-            StatusCode::BAD_REQUEST,
-            "bad_data",
-            "at least one match[] parameter is required".to_string(),
-        );
-    }
-    let mut series_list: Vec<HashMap<String, String>> = Vec::new();
-    for m in match_params {
-        let m = m.trim();
-        if m.is_empty() {
-            continue;
+    let start_ns = match start_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => 0,
+    };
+    let end_ns = match end_param.and_then(|s| parse_time_param(Some(s)).ok()) {
+        Some(t) => t,
+        None => now_ns(),
+    };
+    match promql::series(db, match_params, start_ns, end_ns) {
+        Ok(data) => PrometheusApiResponse::ok_json(data),
+        Err(promql::PromqlError::BadParameter(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::BAD_REQUEST, "bad_data", e)
         }
-        let instant = match parse_instant_selector(m) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for (series_name, tags) in db.list_series_keys() {
-            if series_matches_selector(&series_name, &tags, &instant.selector) {
-                let labels = metric_from_series_and_tags(&series_name, &tags);
-                if !series_list.iter().any(|l| l == &labels) {
-                    series_list.push(labels);
-                }
-            }
+        Err(promql::PromqlError::Parse(e)) => {
+            PrometheusApiResponse::err_json(StatusCode::UNPROCESSABLE_ENTITY, "bad_data", e)
         }
+        Err(promql::PromqlError::Execution(e)) => PrometheusApiResponse::err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        ),
     }
-    PrometheusApiResponse::ok_json(series_list)
 }
 
 #[cfg(test)]
@@ -1179,6 +1177,25 @@ mod tests {
     }
 
     #[test]
+    fn series_with_start_end_restricts_to_time_range() {
+        // Same fixture: api at 1s, 2s; web at 1.5s. start=2, end=2.5 -> only api has data in range.
+        let (db, _guard) = make_db_with_series();
+        let r = handle_series(
+            &["http_requests_total".to_string()],
+            Some("2"),
+            Some("2.5"),
+            &db,
+        );
+        assert_eq!(r.status, StatusCode::OK);
+        let s = String::from_utf8(r.body).unwrap();
+        let body: ApiEnvelope<Vec<HashMap<String, String>>> = serde_json::from_str(&s).unwrap();
+        assert_eq!(body.status.as_str(), "success");
+        let data = body.data.unwrap();
+        assert_eq!(data.len(), 1, "only api has a point in [2s, 2.5s]");
+        assert_eq!(data[0].get("job"), Some(&"api".to_string()));
+    }
+
+    #[test]
     fn query_range_valid_returns_matrix() {
         let (db, _guard) = make_db_with_series();
         let r = handle_query_range(
@@ -1202,7 +1219,7 @@ mod tests {
 
     #[test]
     fn query_surface_rejects_aggregation() {
-        let e = parse_instant_selector("sum(rate(x[5m]))").unwrap_err();
+        let e = crate::query_surface::parse_instant_selector("sum(rate(x[5m]))").unwrap_err();
         assert!(
             e.contains("aggregation") || e.contains("function") || e.contains("not yet supported")
         );
