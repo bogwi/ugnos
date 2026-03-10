@@ -9,7 +9,7 @@
 For project goals and long-term architecture, see the [whitepaper](Ugnos_Concurrent_Time-Series_Database_Core_Whitepaper.md).
 
 We plan to add client SDKs for multiple languages (Rust, Go, Python, TypeScript); the order and the structure is not yet fixed. We tend to monorepo, as shown below:
-```
+```text
 Organization: ugnos
 
 Single repo: ugnos/ugnos (or ugnos/monorepo)
